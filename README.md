@@ -9,6 +9,11 @@
   <img alt="Async" src="https://img.shields.io/badge/Async-aiohttp-blue">
 </p>
 
+<img width="2760" height="1672" alt="image" src="https://github.com/user-attachments/assets/53b1288b-20a8-4f32-8395-cde8f6b28df7" />
+
+<img width="1096" height="1922" alt="image" src="https://github.com/user-attachments/assets/6994da1d-6b4a-48c5-b09d-c3375622c18e" />
+
+
 ---
 
 ## ✨ Highlights
