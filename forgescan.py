@@ -6,6 +6,7 @@ ForgeScan v2.1.0 — Massive Web Vendor & Version Scanner (single file)
 """
 
 import asyncio
+import ipaddress
 import aiohttp
 import argparse
 import json
@@ -42,34 +43,68 @@ def human_url(u: str) -> str:
     except Exception:
         return u
 
-def normalize_targets(lines):
+def normalize_targets(lines, ports=None):
+    """
+    lines: iterable of raw targets (host, host:port, URL, etc.)
+    ports: Optional[Iterable[int]] - if provided, for bare hosts/host:port
+           we will schedule BOTH http:// and https:// for each port.
+           If not provided, legacy behavior (try http, fallback to https in scan_one).
+    """
+    # parse ports
+    port_list = []
+    if ports:
+        seenp = set()
+        for p in ports:
+            try:
+                pi = int(str(p).strip())
+                if 1 <= pi <= 65535 and pi not in seenp:
+                    port_list.append(pi); seenp.add(pi)
+            except Exception:
+                pass
     targets = []
     for raw in lines:
-        line = raw.strip()
+        line = (raw or "").strip()
         if not line or line.startswith("#"):
             continue
-        if not re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", line):
-            host = line
-            if ":" in host and not host.endswith("://"):
-                h, _, port = host.partition(":")
-                try:
-                    int(port)
-                    targets.append(f"http://{h}:{port}/")  # try HTTP first; fallback to HTTPS in scan_one
-                    continue
-                except Exception:
-                    pass
-            targets.append(f"http://{host}/")  # try HTTP first; fallback to HTTPS in scan_one
-        else:
+
+        # already a URL with scheme
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", line):
             if not line.endswith("/"):
                 line = line + "/"
             targets.append(line)
-    seen = set()
-    uniq = []
+            continue
+
+        # hostname[:port]
+        host = line
+        explicit_port = None
+        if ":" in host and not host.endswith("://"):
+            h, _, port = host.partition(":")
+            try:
+                explicit_port = int(port)
+                host = h
+            except Exception:
+                explicit_port = None
+
+        # if ports provided, expand BOTH schemes for each port (explicit included)
+        if port_list or explicit_port:
+            ports_to_use = list(port_list)
+            if explicit_port and explicit_port not in ports_to_use:
+                ports_to_use.append(explicit_port)
+            for p in ports_to_use:
+                targets.append(f"http://{host}:{p}/")
+                targets.append(f"https://{host}:{p}/")
+            continue
+
+        # legacy behavior: try HTTP first; HTTPS fallback in scan_one
+        targets.append(f"http://{host}/")
+
+    # dedup preserving order
+    seen = set(); uniq = []
     for t in targets:
         if t not in seen:
-            uniq.append(t)
-            seen.add(t)
+            uniq.append(t); seen.add(t)
     return uniq
+
 
 def extract_title(html: str) -> str:
     m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
@@ -1503,6 +1538,50 @@ def render_md(rows, headers):
         lines.append("| " + " | ".join(str(c).replace("\n"," ") for c in r) + " |")
     return "\n".join(lines)
 
+def _split_csv_ports(s: str):
+    if not s:
+        return []
+    out = []
+    for chunk in s.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        try:
+            v = int(chunk)
+            if 1 <= v <= 65535:
+                out.append(v)
+        except Exception:
+            pass
+    return out
+
+
+def expand_cli_targets(items):
+    """
+    items: list[str] from -t/--targets (IPs/hosts and/or CIDR).
+    Returns list[str] of hosts (without scheme).
+    """
+    out = []
+    for it in (items or []):
+        it = it.strip()
+        if not it:
+            continue
+        # CIDR?
+        try:
+            net = ipaddress.ip_network(it, strict=False)
+            # for /32 include the single address; for larger — only hosts()
+            if net.prefixlen >= (32 if net.version == 4 else 128):
+                out.append(str(net.network_address))
+            else:
+                for ip in net.hosts():
+                    out.append(str(ip))
+            continue
+        except Exception:
+            pass
+        # plain IP or hostname
+        out.append(it)
+    return out
+
+
 # -------- Findings summary helpers --------
 def build_findings(rows):
     """
@@ -1732,20 +1811,81 @@ async def nvd_fetch_all(session, vendor, product, api_key=None, timeout=25):
     return vulns
 
 def _extract_metrics(cve_obj):
-    # prefer CVSS v3.1 then v3.0 then v2
+    """
+    Returns (score, severity, privilegesRequired, userInteraction, attackVector)
+    Prefers CVSS v3.1 -> v3.0 -> v2 (PR/UI/AV only for v3.* if present).
+    """
     cve = cve_obj.get("cve", {})
     metrics = cve.get("metrics", {})
-    score = None; severity = None
-    if "cvssMetricV31" in metrics and metrics["cvssMetricV31"]:
-        m = metrics["cvssMetricV31"][0].get("cvssData", {})
-        score = m.get("baseScore"); severity = metrics["cvssMetricV31"][0].get("baseSeverity")
-    elif "cvssMetricV30" in metrics and metrics["cvssMetricV30"]:
-        m = metrics["cvssMetricV30"][0].get("cvssData", {})
-        score = m.get("baseScore"); severity = metrics["cvssMetricV30"][0].get("baseSeverity")
-    elif "cvssMetricV2" in metrics and metrics["cvssMetricV2"]:
-        m = metrics["cvssMetricV2"][0]
-        score = m.get("cvssData", {}).get("baseScore"); severity = m.get("baseSeverity")
-    return score, severity
+    score = None; severity = None; pr = None; ui = None; av = None
+
+    def pick_v3(arr_name):
+        nonlocal score, severity, pr, ui, av
+        arr = metrics.get(arr_name) or []
+        if not arr:
+            return False
+        m = arr[0]  # take the first
+        data = m.get("cvssData", {})
+        score = data.get("baseScore", m.get("cvssData", {}).get("baseScore"))
+        severity = m.get("baseSeverity", m.get("baseSeverity"))
+        pr = data.get("privilegesRequired")
+        ui = data.get("userInteraction")
+        av = data.get("attackVector")
+        return True
+
+    if pick_v3("cvssMetricV31"):
+        return score, severity, pr, ui, av
+    if pick_v3("cvssMetricV30"):
+        return score, severity, pr, ui, av
+
+    # CVSS v2 fallback
+    arr2 = metrics.get("cvssMetricV2") or []
+    if arr2:
+        m = arr2[0]
+        score = (m.get("cvssData") or {}).get("baseScore")
+        severity = m.get("baseSeverity")
+    return score, severity, pr, ui, av
+
+def _extract_cve_title(cve_obj):
+    cve = cve_obj.get("cve", {})
+    titles = cve.get("titles") or []
+    for t in titles:
+        if t.get("lang") == "en" and t.get("title"):
+            return t["title"].strip()
+    # fallback: короткая выжимка из описания
+    descs = cve.get("descriptions") or []
+    for d in descs:
+        if d.get("lang") == "en" and d.get("value"):
+            txt = d["value"].strip()
+            # первые 120 символов без перевода строки
+            txt = re.sub(r"\s+", " ", txt)[:120]
+            return txt
+    return ""
+
+
+def _is_cve_unauth(cve_obj):
+    """
+    Грубая, но практичная эвристика:
+    - ключевые слова в описании: unauthenticated, pre-auth, without authentication и т.п.
+    - CVSS v3.* с PrivilegesRequired == NONE (часто «pre-auth»)
+    """
+    # словари
+    kw = [
+        r"unauthenticated", r"pre[-\s]?auth", r"without authentication",
+        r"no authentication required", r"no auth required", r"preauthentication",
+        r"pre authentication", r"before authentication"
+    ]
+    cve = cve_obj.get("cve", {})
+    descs = cve.get("descriptions") or []
+    text = " ".join([d.get("value","") for d in descs]).lower()
+    if any(re.search(k, text, re.I) for k in kw):
+        return True
+
+    score, severity, pr, ui, av = _extract_metrics(cve_obj)
+    if (pr or "").upper() == "NONE":
+        return True
+    return False
+
 
 def _cpe_version_from_criteria(criteria: str) -> str:
     # cpe:2.3:a:vendor:product:version:update:...
@@ -1793,7 +1933,7 @@ def _iter_cpe_ranges(cve_obj, wanted_vendor_product=None):
 
 def filter_cves_for_version(vulns, product_version, vendors_products):
     """
-    Returns list of dicts: {id, published, score, severity, affected, description}
+    Returns list of dicts: {id, title, published, score, severity, affected, description, unauth}
     Only those where product_version is within any vulnerable range for desired vendor/product.
     """
     out = []
@@ -1807,14 +1947,14 @@ def filter_cves_for_version(vulns, product_version, vendors_products):
             if d.get("lang") == "en":
                 description = d.get("value","")
                 break
-        score, severity = _extract_metrics(v)
+        title = _extract_cve_title(v)
+        score, severity, pr, ui, av = _extract_metrics(v)
         matched = False
         best_range = None
         for (vendor, product, start_inc, start_exc, end_inc, end_exc, exact) in _iter_cpe_ranges(v, vendors_products):
             if _ver_in_range(pv, start_inc, start_exc, end_inc, end_exc, exact if exact and exact != "*" else None):
                 matched = True
                 best_range = (start_inc, start_exc, end_inc, end_exc, exact)
-                # don't break; we want the most specific: prefer explicit end/start
                 if (end_inc or end_exc) and (start_inc or start_exc):
                     break
         if matched:
@@ -1827,11 +1967,13 @@ def filter_cves_for_version(vulns, product_version, vendors_products):
             )
             out.append({
                 "id": cve_id,
+                "title": title,
                 "published": published,
                 "score": score,
                 "severity": severity,
                 "affected": rng,
-                "description": description
+                "description": description,
+                "unauth": _is_cve_unauth(v)
             })
     # stable sort by published desc then score desc
     def _safe_date(s):
@@ -1841,6 +1983,7 @@ def filter_cves_for_version(vulns, product_version, vendors_products):
             return datetime.min.replace(tzinfo=timezone.utc)
     out.sort(key=lambda x: (_safe_date(x["published"]), x["score"] or 0.0), reverse=True)
     return out
+
 
 async def enrich_cves(findings, args):
     """
@@ -1926,27 +2069,32 @@ def print_cves_console(cve_summary, use_color=True):
     if not arr:
         return
 
-    c = ANSI if use_color else {k:"" for k in ANSI}
+    # локальные ANSI (не меняем глобальный словарь, чтобы не ломать ничего)
+    A = {
+        "reset":"\x1b[0m","bold":"\x1b[1m",
+        "green":"\x1b[32m","yellow":"\x1b[33m","red":"\x1b[31m",
+        "cyan":"\x1b[36m","magenta":"\x1b[35m","gray":"\x1b[90m",
+        "bg_yellow":"\x1b[43m"
+    } if use_color else {k:"" for k in ["reset","bold","green","yellow","red","cyan","magenta","gray","bg_yellow"]}
 
-    # Цвета по severity
-    def sev_style(sev: str, s: str) -> str:
-        sev = (sev or "").upper()
-        if not use_color:
-            return s
+    def style_cvss(score, severity):
+        sev = (severity or "").upper()
+        score_s = "-" if score is None else f"{score:.1f}"
+        label = f"CVSS {score_s} {severity or '-'}"
+        if score is not None and score >= 8.8:
+            return f"{A['bold']}{A['red']}{label}{A['reset']}"
         if sev == "CRITICAL":
-            return f"{ANSI['bold']}{ANSI['red']}{s}{ANSI['reset']}"
+            return f"{A['bold']}{A['red']}{label}{A['reset']}"
         if sev == "HIGH":
-            return f"{ANSI['red']}{s}{ANSI['reset']}"
+            return f"{A['red']}{label}{A['reset']}"
         if sev == "MEDIUM":
-            return f"{ANSI['yellow']}{s}{ANSI['reset']}"
+            return f"{A['yellow']}{label}{A['reset']}"
         if sev == "LOW":
-            return f"{ANSI['green']}{s}{ANSI['reset']}"
-        return f"{ANSI['gray']}{s}{ANSI['reset']}"
+            return f"{A['green']}{label}{A['reset']}"
+        return f"{A['gray']}{label}{A['reset']}"
 
-    # Заголовок
-    print("\n" + (f"{c['magenta']}{c['bold']}CVE{c['reset']}" if use_color else "CVE") + ":")
+    print("\n" + (f"{A['magenta']}{A['bold']}CVE{A['reset']}" if use_color else "CVE") + ":")
 
-    # Группировка по продукту
     by_prod = {}
     for item in arr:
         by_prod.setdefault(item["product"], []).append(item)
@@ -1954,28 +2102,22 @@ def print_cves_console(cve_summary, use_color=True):
     for prod, items in by_prod.items():
         title = f"{prod}:"
         if use_color:
-            title = f"{ANSI['cyan']}{ANSI['bold']}{prod}{ANSI['reset']}:"
+            title = f"{A['cyan']}{A['bold']}{prod}{A['reset']}:"
         print(title)
-
-        # сортировка версий по возрастанию
         items.sort(key=lambda x: _split_ver(x["version"]))
-
         for it in items:
-            ver = it["version"]
-            cves = it["cves"]
-            urls = it["targets"]
-            head = f"  {ver} ({len(cves)}):"
-            print(head)
+            ver = it["version"]; cves = it["cves"]; urls = it["targets"]
+            print(f"  {ver} ({len(cves)}):")
             for cv in cves:
-                sev = cv.get("severity") or "-"
-                score = cv.get("score")
-                score_s = f"{score:.1f}" if isinstance(score,(int,float)) else "-"
-                aff = cv.get("affected") or "(unspecified)"
-                # строка CVE
-                left = f"{cv['id']} — affected: {aff}"
-                right = sev_style(sev, f"CVSS {score_s} {sev}")
-                print(f"    • {left} — {right}")
-            # Список целей
+                left = f"{cv['id']}"
+                if cv.get("title"):
+                    left += f" — {cv['title']}"
+                right = style_cvss(cv.get("score"), cv.get("severity"))
+                line = f"    • {left} — affected: {cv.get('affected') or '(unspecified)'} — {right}"
+                if cv.get("unauth"):
+                    # жёлтый фон + красный текст
+                    line = f"{A['bg_yellow']}{A['red']}{line}{A['reset']}"
+                print(line)
             if urls:
                 print("    Targets:")
                 for u in urls:
@@ -2009,7 +2151,9 @@ def cves_to_markdown(cve_summary):
                 score = cv.get("score")
                 score_s = f"{score:.1f}" if isinstance(score,(int,float)) else "-"
                 aff = cv.get("affected") or "(unspecified)"
-                out.append(f"  - {emoji} **{cv['id']}** · affected: **{aff}** · CVSS **{score_s} {cv.get('severity','-')}**")
+                title = f" — {cv['title']}" if cv.get("title") else ""
+                unauth = " — 🟡 **UNAUTH**" if cv.get("unauth") else ""
+                out.append(f"  - {emoji} **{cv['id']}**{title} · affected: **{aff}** · CVSS **{score_s} {cv.get('severity','-')}**{unauth}")
             if urls:
                 out.append("  - Targets:")
                 for u in urls:
@@ -2017,15 +2161,431 @@ def cves_to_markdown(cve_summary):
         out.append("")
     return "\n".join(out)
 
+def save_html_report(path, rows, findings, cve_summary, generated_at=None, scanner_version=None):
+    generated_at = generated_at or now_iso()
+    scanner_version = scanner_version or __VERSION__
+
+    # --- CVE индекс по (Product, Version) ---
+    bypv = {}
+    for item in cve_summary.get("by_product_version", []):
+        key = f"{item.get('product','')}|||{item.get('version','')}"
+        cves_norm = []
+        for cv in item.get("cves", []):
+            cves_norm.append({
+                "id": cv.get("id"),
+                "title": cv.get("title") or "",
+                "score": cv.get("score"),
+                "severity": cv.get("severity") or "",
+                "affected": cv.get("affected") or "",
+                "description": cv.get("description") or "",
+                "unauth": bool(cv.get("unauth")),
+                "published": cv.get("published") or ""
+            })
+        bypv[key] = cves_norm
+
+    cve_enabled = bool(bypv)
+
+    # JSON payloads для встраивания в JS
+    rows_json = json.dumps(rows, ensure_ascii=False)
+    cve_map_json = json.dumps(bypv, ensure_ascii=False)
+    cve_enabled_js = "true" if cve_enabled else "false"
+
+    # Ровный вывод «Findings» (фикс кривых {{len(v)}} на скрине)
+    findings_html = (
+        "".join(
+            f'<div class="tag">{p} <span class="mono">({len(v)})</span></div>'
+            for p, v in findings.items()
+        ) or '<span class="muted">No findings.</span>'
+    )
+
+    # Заголовок колонки CVE (вставим позже в f-string без экранирования)
+    cve_th = '<th data-col="cve" data-k="8">CVE</th>' if cve_enabled else ""
+
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ForgeScan Report</title>
+<style>
+  :root {{
+    --bg: #0b1020;
+    --card: rgba(255,255,255,0.08);
+    --card-2: rgba(255,255,255,0.06);
+    --text: #e7ecf3;
+    --muted: #9fb0c8;
+    --accent: #7cc7ff;
+    --green: #4ade80;
+    --yellow: #fde047;
+    --red: #ef4444;
+    --glass: rgba(255,255,255,0.1);
+    --ring: rgba(124,199,255,0.35);
+  }}
+  html,body {{
+    background: radial-gradient(1200px 800px at 10% -10%, #1a2a4a 0%, #0b1020 35%, #070b13 100%);
+    color: var(--text);
+    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial;
+    margin: 0;
+  }}
+  .wrap {{ width: min(1200px, 94%); margin: 32px auto; }}
+  .hero {{
+    padding: 20px; border-radius: 16px; background: var(--glass); backdrop-filter: blur(10px);
+    box-shadow: 0 10px 40px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.05);
+    border: 1px solid rgba(255,255,255,.12);
+  }}
+  h1 {{ margin: 0 0 8px 0; font-size: 26px; letter-spacing:.2px }}
+  .meta {{ color: var(--muted); font-size: 13px }}
+
+  .card {{
+    border-radius: 16px; padding: 14px; background: var(--card); border:1px solid rgba(255,255,255,.1);
+    box-shadow: 0 6px 30px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.04);
+  }}
+  .block {{ margin-top: 14px; }}
+  .toolbar {{ display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap }}
+  .search {{ flex:1 1 260px; min-width: 220px; position:relative }}
+  .search input {{
+    width:100%; padding:10px 12px; border-radius:12px; background: var(--card-2); color:var(--text);
+    border:1px solid rgba(255,255,255,.1); outline:none;
+  }}
+  .tag {{
+    display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius: 999px;
+    background: var(--card-2); color: var(--muted); font-size:12px; margin:4px 6px 0 0; white-space:nowrap
+  }}
+
+  table {{ width:100%; border-collapse: collapse; font-size:14px; table-layout: fixed }}
+  th,td {{ padding: 10px 8px; border-bottom:1px dashed rgba(255,255,255,.08); vertical-align: top }}
+  th {{
+    text-align:left; color: var(--muted); cursor:pointer; position:sticky; top:0;
+    background:linear-gradient(180deg, rgba(11,16,32,.95), rgba(11,16,32,.65));
+    backdrop-filter: blur(6px); z-index: 2;
+  }}
+
+  /* Ширины по % (с CVE сумма = 100%) */
+  th[data-col="target"], td[data-col="target"] {{ width: 22%; }}
+  th[data-col="product"], td[data-col="product"] {{ width: 13%; }}
+  th[data-col="version"], td[data-col="version"] {{ width: 9%; }}
+  th[data-col="vendor"], td[data-col="vendor"] {{ width: 10%; }}
+  th[data-col="conf"], td[data-col="conf"] {{ width: 7%; }}
+  th[data-col="http"], td[data-col="http"] {{ width: 7%; }}
+  th[data-col="server"], td[data-col="server"] {{ width: 12%; }}
+  th[data-col="title"], td[data-col="title"] {{ width: 12%; }}
+  th[data-col="cve"], td[data-col="cve"] {{ width: 8%; }}
+
+  @media (max-width: 900px) {{
+    th[data-col="server"], td[data-col="server"] {{ display:none }}
+    th[data-col="vendor"], td[data-col="vendor"] {{ display:none }}
+  }}
+  @media (max-width: 700px) {{
+    th[data-col="title"], td[data-col="title"] {{ display:none }}
+  }}
+
+  tbody tr:hover {{ background: rgba(255,255,255,.04); }}
+
+  .pill {{ display:inline-flex; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid rgba(255,255,255,.15) }}
+  .ok {{ color: var(--green) }}
+  .warn {{ color: var(--yellow) }}
+  .bad {{ color: var(--red) }}
+  .muted {{ color: var(--muted) }}
+  .h2 {{ font-weight:600; margin:0 0 8px 0; font-size:18px }}
+  .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
+
+  /* CVE раскрывашка */
+  .cve-btn {{
+    display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:10px;
+    border:1px solid rgba(255,255,255,.18); background: var(--card-2);
+    user-select:none; cursor:pointer;
+  }}
+  .cve-btn .carat {{ transition: transform .18s ease; display:inline-block }}
+  .cve-btn.open .carat {{ transform: rotate(180deg) }}
+  tr.cve-expand > td {{ padding: 0; background: rgba(255,255,255,.035) }}
+  .cve-panel {{ padding: 12px 12px 14px 12px; }}
+  .cve-table {{ width:100%; border-collapse: collapse; font-size:13px }}
+  .cve-table th, .cve-table td {{ padding:8px 6px; border-bottom:1px dashed rgba(255,255,255,.08) }}
+  .sev-critical {{ color: var(--red); font-weight:600 }}
+  .sev-high {{ color: var(--red) }}
+  .sev-medium {{ color: var(--yellow) }}
+  .sev-low {{ color: var(--green) }}
+  .badge-unauth {{
+    display:inline-block; margin-left:6px; padding:2px 6px; border-radius:999px;
+    background: rgba(253,224,71,.25); border:1px solid rgba(253,224,71,.5); color:#ff4d4d; font-size:11px
+  }}
+  details.cve-detail > summary {{ list-style:none; cursor:pointer; outline:none; }}
+  details.cve-detail > summary::-webkit-details-marker {{ display:none; }}
+  details.cve-detail[open] > summary .mini-carat {{ transform: rotate(90deg) }}
+  .mini-carat {{
+    display:inline-block; width:0; height:0; border-top:5px solid transparent; border-bottom:5px solid transparent;
+    border-left:6px solid var(--muted); margin-right:6px; transition: transform .18s ease
+  }}
+  .desc-box {{ margin-top:6px; padding:8px; background: var(--card-2); border:1px solid rgba(255,255,255,.12); border-radius:10px }}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hero">
+    <h1>ForgeScan Report</h1>
+    <div class="meta">Generated <span class="mono">{generated_at}</span> · Scanner v{scanner_version}</div>
+    <div class="meta">Rows: {len(rows)} · Products: {len(findings)}</div>
+  </div>
+
+  <div class="block card">
+    <div class="h2">Findings</div>
+    <div class="tags">{findings_html}</div>
+  </div>
+
+  <div class="block card">
+    <div class="toolbar">
+      <div class="search"><input id="q" placeholder="Search in table (target, product, version, title)…"></div>
+      <div class="tag">HTTP: <span id="stat-ok" class="ok">0</span></div>
+      <div class="tag">3xx/4xx/5xx: <span id="stat-bad" class="bad">0</span></div>
+    </div>
+
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th data-col="target" data-k="0">Target</th>
+          <th data-col="product" data-k="1">Product</th>
+          <th data-col="version" data-k="2">Version</th>
+          <th data-col="vendor" data-k="3">Vendor</th>
+          <th data-col="conf" data-k="4">Confidence</th>
+          <th data-col="http" data-k="5">HTTP</th>
+          <th data-col="server" data-k="6">Server</th>
+          <th data-col="title" data-k="7">Title</th>
+          {cve_th}
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// Данные — отдельными константами, чтобы не путать фигурные скобки f-строки
+const ROWS = {rows_json};
+const CVE_MAP = {cve_map_json};
+const CVE_ENABLED = {cve_enabled_js};
+const DATA = {{ rows: ROWS, cveMap: CVE_MAP, cveEnabled: CVE_ENABLED }};
+
+function keyFor(row) {{
+  const prod = (row[1]||"").trim();
+  const ver  = (row[2]||"").trim();
+  return prod + "|||" + ver;
+}}
+function getCves(row) {{
+  if (!DATA.cveEnabled) return [];
+  const key = keyFor(row);
+  return DATA.cveMap[key] || [];
+}}
+
+function sevRank(sev) {{
+  const s = (sev||"").toUpperCase();
+  if (s === "CRITICAL") return 4;
+  if (s === "HIGH") return 3;
+  if (s === "MEDIUM") return 2;
+  if (s === "LOW") return 1;
+  return 0;
+}}
+
+function buildCvePanel(cves) {{
+  const sorted = cves.slice().sort((a,b) => {{
+    const r = sevRank(b.severity) - sevRank(a.severity);
+    if (r !== 0) return r;
+    return (b.score||0) - (a.score||0);
+  }});
+
+  let html = '<div class="cve-panel">';
+  html += '<table class="cve-table"><thead><tr><th style="width:18%">CVE</th><th>Title</th><th style="width:12%">CVSS</th><th style="width:14%">Severity</th></tr></thead><tbody>';
+
+  for (const cv of sorted) {{
+    const sev = (cv.severity||"-").toUpperCase();
+    const sevCls = sev === "CRITICAL" ? "sev-critical" : (sev === "HIGH" ? "sev-high" : (sev === "MEDIUM" ? "sev-medium" : "sev-low"));
+    const score = (typeof cv.score === "number") ? cv.score.toFixed(1) : "-";
+    const unauth = cv.unauth ? '<span class="badge-unauth">UNAUTH</span>' : '';
+    const title = (cv.title||"").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    const desc  = (cv.description||"").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    const affected = (cv.affected||"").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    html += '<tr><td class="mono">'+cv.id+'</td><td>';
+    html += '<details class="cve-detail"><summary><span class="mini-carat"></span>'+title+'</summary>';
+    html += '<div class="desc-box"><div class="mono muted" style="margin-bottom:6px;">affected: '+(affected||'(unspecified)')+'</div>'+desc+'</div>';
+    html += '</details>';
+    html += '</td><td>'+score+'</td><td class="'+sevCls+'">'+sev+unauth+'</td></tr>';
+  }}
+
+  html += '</tbody></table></div>';
+  return html;
+}}
+
+function render(rows) {{
+  const tb = document.querySelector("#tbl tbody");
+  tb.innerHTML = "";
+  let ok=0, bad=0;
+  rows.forEach(r => {{
+    const tr = document.createElement("tr");
+    const code = parseInt(r[5],10)||0;
+    if (code>=200 && code<300) ok++; else bad++;
+
+    // первые 8 колонок
+    r.forEach((c,i)=> {{
+      const td=document.createElement("td");
+      td.dataset.col = ["target","product","version","vendor","conf","http","server","title"][i];
+      td.textContent=String(c);
+      if (i===2 && c && c!=="-" && c!=="version not detected") td.classList.add("ok");
+      if (i===5) {{
+        if (code>=200 && code<300) td.classList.add("ok");
+        else if (code>=300 && code<400) td.classList.add("warn");
+        else td.classList.add("bad");
+      }}
+      tr.appendChild(td);
+    }});
+
+    // колонка CVE
+    if (DATA.cveEnabled) {{
+      const td = document.createElement("td");
+      td.dataset.col = "cve";
+      const cves = getCves(r);
+      const count = cves.length;
+      const btn = document.createElement("span");
+      btn.className = "cve-btn";
+      btn.innerHTML = '<span class="carat">▼</span><span class="mono">'+count+'</span>';
+      if (count === 0) {{
+        btn.style.opacity = .55;
+        btn.style.cursor = "default";
+      }} else {{
+        btn.addEventListener("click", () => {{
+          const already = tr.nextElementSibling && tr.nextElementSibling.classList.contains("cve-expand");
+          if (already) {{
+            tr.nextElementSibling.remove();
+            btn.classList.remove("open");
+            return;
+          }}
+          if (tr.parentElement) {{
+            const ex = tr.parentElement.querySelector("tr.cve-expand");
+            if (ex) ex.remove();
+            const opened = tr.parentElement.querySelector(".cve-btn.open");
+            if (opened) opened.classList.remove("open");
+          }}
+          const exp = document.createElement("tr");
+          exp.className = "cve-expand";
+          const tdx = document.createElement("td");
+          const colSpan = tr.children.length; // все колонки
+          tdx.colSpan = colSpan;
+          tdx.innerHTML = buildCvePanel(cves);
+          exp.appendChild(tdx);
+          tr.after(exp);
+          btn.classList.add("open");
+        }});
+      }}
+      td.appendChild(btn);
+      tr.appendChild(td);
+    }}
+
+    tb.appendChild(tr);
+  }});
+  document.getElementById("stat-ok").textContent = ok;
+  document.getElementById("stat-bad").textContent = bad;
+}}
+
+let current = DATA.rows.slice();
+render(current);
+
+document.getElementById("q").addEventListener("input", e => {{
+  const q = e.target.value.toLowerCase();
+  if (!q) return render(DATA.rows);
+  const f = DATA.rows.filter(r => r.join(" ").toLowerCase().includes(q));
+  render(f);
+}});
+
+// сортировка по клику на заголовке
+document.querySelectorAll("#tbl thead th").forEach(th => {{
+  th.addEventListener("click", () => {{
+    const k = parseInt(th.dataset.k,10);
+    current.sort((a,b) => {{
+      if (DATA.cveEnabled && k===8) {{
+        const ca = getCves(a).length, cb = getCves(b).length;
+        return cb - ca; // по убыванию количества CVE
+      }}
+      return String(a[k]).localeCompare(String(b[k]), undefined, {{numeric:true}});
+    }});
+    render(current);
+  }});
+}});
+</script>
+</body>
+</html>
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+
+
+
+def generate_cve_html_blocks(cve_summary):
+    """
+    Возвращает HTML блок(и) со списками CVE per product/version.
+    """
+    arr = cve_summary.get("by_product_version", [])
+    if not arr:
+        return '<div class="muted">No CVEs.</div>'
+
+    # сгруппируем по продукту
+    by_prod = {}
+    for item in arr:
+        by_prod.setdefault(item["product"], []).append(item)
+
+    chunks = []
+    for prod, items in by_prod.items():
+        items.sort(key=lambda x: _split_ver(x["version"]))
+        buf = [f'<div class="card" style="background:var(--card-2); margin-top:10px;"><div class="h2">{prod}</div>']
+        for it in items:
+            ver = it["version"]; cves = it.get("cves",[]); urls = it.get("targets",[])
+            buf.append(f'<div class="muted" style="margin:6px 0 2px 0;">{ver} — {len(cves)} CVE</div>')
+            if cves:
+                buf.append('<ul class="cvelist">')
+                for cv in cves:
+                    score = cv.get("score")
+                    sev = (cv.get("severity") or "").upper()
+                    cls = []
+                    if score is not None and score >= 8.8: cls.append("sev-critical")
+                    if cv.get("unauth"): cls.append("unauth")
+                    title = (cv.get("title") or "").replace("<","&lt;").replace(">","&gt;")
+                    aff = cv.get("affected") or "(unspecified)"
+                    score_s = "-" if score is None else f"{score:.1f}"
+                    li = f'<li class="{" ".join(cls)}"><span class="mono">{cv["id"]}</span>{(" — "+title) if title else ""}<br><span class="muted">affected: {aff} · CVSS {score_s} {sev or "-"}</span></li>'
+                    buf.append(li)
+                buf.append('</ul>')
+            if urls:
+                buf.append('<div class="muted" style="margin-top:6px;">Targets:</div><div class="mono" style="font-size:12px;">' + "<br>".join(urls) + "</div>")
+        buf.append("</div>")
+        chunks.append("".join(buf))
+    return "".join(chunks)
+
 
 # ---------------- main scan flow ----------------
 
 async def run_scan(args):
-    with open(args.input, "r", encoding="utf-8") as f:
-        targets = normalize_targets(f.readlines())
-    if not targets:
-        print("No valid targets in input.", file=sys.stderr)
+    raw_lines = []
+
+    # 1) цели из -t/--targets (CIDR/hosts/IPs)
+    if args.targets:
+        raw_lines.extend(expand_cli_targets(args.targets))
+
+    # 2) цели из файла, если файл существует (сохраняем старую семантику)
+    file_exists = os.path.exists(args.input)
+    if file_exists:
+        with open(args.input, "r", encoding="utf-8") as f:
+            raw_lines.extend([ln.rstrip("\n") for ln in f])
+
+    if not raw_lines:
+        print("No targets provided. Use -i file or -t CIDR/IP/host ...", file=sys.stderr)
         return 2
+
+    # доп. порты из -p
+    extra_ports = _split_csv_ports(args.ports) if getattr(args, "ports", None) else []
+
+    targets = normalize_targets(raw_lines, ports=extra_ports if extra_ports else None)
+    if not targets:
+        print("No valid targets after normalization.", file=sys.stderr)
+        return 2
+
     # Prepare formats and live rendering
     fmts = [x.strip().lower() for x in args.format.split(",")]
     live_enabled = (sys.stdout.isatty() and ("table" in fmts))
@@ -2035,7 +2595,6 @@ async def run_scan(args):
     total = len(targets)
     headers = ["Target","Product","Version","Vendor","Confidence","HTTP","Server","Title"]
     if live_enabled:
-        # Hide cursor
         sys.stdout.write("\x1b[?25l")
         sys.stdout.flush()
     try:
@@ -2063,7 +2622,6 @@ async def run_scan(args):
                         live_rows.append([hu, name, version, vendor, str(conf), str(status), server, title])
                     render_live_table(live_rows, headers, done, total, args.color)
                 else:
-                    # Basic progress when not rendering table live
                     sys.stdout.write("\r" + render_progress_line(done, total, args.color))
                     sys.stdout.flush()
             if not live_enabled:
@@ -2072,7 +2630,6 @@ async def run_scan(args):
 
     finally:
         if live_enabled:
-            # Show cursor back
             sys.stdout.write("\x1b[?25h\n")
             sys.stdout.flush()
 
@@ -2097,35 +2654,26 @@ async def run_scan(args):
                      name or "-", display_version, vendor or "-", str(conf) if conf else "-",
                      str(status) if status else "-", server or "-", title[:60] or "-"])
 
-    # Build findings from final deduped rows
     findings = build_findings(rows)
 
-    # CVE enrichment if requested
     cve_summary = {"by_product_version": []}
     if args.cve:
         cve_summary = await enrich_cves(findings, args)
 
-    headers = ["Target","Product","Version","Vendor","Confidence","HTTP","Server","Title"]
     os.makedirs(args.outdir, exist_ok=True)
-    fmts = [x.strip().lower() for x in args.format.split(",")]
 
-    # Print table (static) if not live
+    # table (static) если не live
     if "table" in fmts and not live_enabled:
         print(fmt_table(rows, headers, colorize=colorize_factory(args.color)))
-    # Print pretty Findings in console (after table)
+
+    # Findings
     print_findings_console(findings, use_color=args.color)
-    # Print CVE section
+
+    # CVE
     if args.cve:
         print_cves_console(cve_summary, use_color=args.color)
 
     # Save JSON / CSV / MD
-    summary_json = {
-        "generated_at": now_iso(),
-        "scanner":{"name":"ForgeScan","version":__VERSION__},
-        "summary": findings_to_json(findings),
-        "vulnerabilities": cve_summary
-    }
-
     if "json" in fmts:
         payload = {"generated_at": now_iso(),
                    "scanner":{"name":"ForgeScan","version":__VERSION__},
@@ -2145,7 +2693,15 @@ async def run_scan(args):
         with open(os.path.join(args.outdir,"report.md"),"w",encoding="utf-8") as f:
             f.write(md)
         print(f"[+] Markdown saved to {os.path.join(args.outdir,'report.md')}")
+
+    # NEW: HTML report
+    if getattr(args, "html", False):
+        html_path = os.path.join(args.outdir, "report.html")
+        save_html_report(html_path, rows, findings, cve_summary, generated_at=now_iso(), scanner_version=__VERSION__)
+        print(f"[+] HTML saved to {html_path}")
+
     return 0
+
 
 def build_parser():
     p = argparse.ArgumentParser(description="ForgeScan v2.1 — Massive Web Vendor & Version Scanner (single file)")
@@ -2169,7 +2725,12 @@ def build_parser():
     p.add_argument("--cve-timeout", type=int, default=30, help="Timeout for NVD requests (seconds)")
     p.add_argument("--cve-concurrency", type=int, default=2, help="Max concurrent NVD product queries")
     p.add_argument("--cve-max-per", type=int, default=0, help="Max CVEs per product+version (0 = unlimited)")
+    # NEW:
+    p.add_argument("--html", action="store_true", help="Generate interactive glassmorphic HTML report (report.html)")
+    p.add_argument("-p","--ports", default="", help="Extra ports to probe (comma-separated). For each port tries both http and https, e.g. 8080,8443")
+    p.add_argument("-t","--targets", nargs="+", help="Targets (space-separated): IPs/hosts and/or CIDR ranges, e.g. 172.16.0.0/16 10.0.0.0/8")
     return p
+
 
 SELFTEST_SAMPLES = [
     ("Jenkins & K8s",
