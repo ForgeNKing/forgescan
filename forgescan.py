@@ -2165,7 +2165,7 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
     generated_at = generated_at or now_iso()
     scanner_version = scanner_version or __VERSION__
 
-    # --- CVE индекс по (Product, Version) ---
+    # --- CVE: индекс (Product, Version) -> список CVE ---
     bypv = {}
     for item in cve_summary.get("by_product_version", []):
         key = f"{item.get('product','')}|||{item.get('version','')}"
@@ -2182,23 +2182,26 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
                 "published": cv.get("published") or ""
             })
         bypv[key] = cves_norm
-
     cve_enabled = bool(bypv)
 
-    # JSON payloads для встраивания в JS
+    # JSON payloads для JS
     rows_json = json.dumps(rows, ensure_ascii=False)
     cve_map_json = json.dumps(bypv, ensure_ascii=False)
     cve_enabled_js = "true" if cve_enabled else "false"
 
-    # Ровный вывод «Findings» (фикс кривых {{len(v)}} на скрине)
+    # Безопасный escape для заголовков в Findings
+    def esc(s: str) -> str:
+        return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+    # Кликабельные теги Findings (кнопки-фильтры)
     findings_html = (
         "".join(
-            f'<div class="tag">{p} <span class="mono">({len(v)})</span></div>'
+            f'<button type="button" class="tag tag-btn" data-prod="{esc(p)}">{esc(p)} '
+            f'<span class="mono">({len(v)})</span></button>'
             for p, v in findings.items()
         ) or '<span class="muted">No findings.</span>'
     )
 
-    # Заголовок колонки CVE (вставим позже в f-string без экранирования)
     cve_th = '<th data-col="cve" data-k="8">CVE</th>' if cve_enabled else ""
 
     html = f"""<!doctype html>
@@ -2241,16 +2244,22 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
     box-shadow: 0 6px 30px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.04);
   }}
   .block {{ margin-top: 14px; }}
-  .toolbar {{ display:flex; gap:10px; align-items:center; margin-bottom:10px; flex-wrap:wrap }}
-  .search {{ flex:1 1 260px; min-width: 220px; position:relative }}
+  .toolbar {{
+    display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+  }}
+  .search {{ flex:1 1 260px; min-width:0; position:relative; }} /* min-width:0 фиксирует наезд */
   .search input {{
     width:100%; padding:10px 12px; border-radius:12px; background: var(--card-2); color:var(--text);
     border:1px solid rgba(255,255,255,.1); outline:none;
   }}
   .tag {{
     display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius: 999px;
-    background: var(--card-2); color: var(--muted); font-size:12px; margin:4px 6px 0 0; white-space:nowrap
+    background: var(--card-2); color: var(--muted); font-size:12px; margin:4px 6px 0 0; white-space:nowrap;
+    border:1px solid rgba(255,255,255,.1);
   }}
+  .tag-btn {{ cursor:pointer; transition: box-shadow .15s ease, transform .03s ease; }}
+  .tag-btn:active {{ transform: translateY(1px) }}
+  .tag-btn.active {{ box-shadow: 0 0 0 2px var(--ring) inset, 0 0 0 1px rgba(124,199,255,.55) inset; color:#cfeaff }}
 
   table {{ width:100%; border-collapse: collapse; font-size:14px; table-layout: fixed }}
   th,td {{ padding: 10px 8px; border-bottom:1px dashed rgba(255,255,255,.08); vertical-align: top }}
@@ -2329,7 +2338,7 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
 
   <div class="block card">
     <div class="h2">Findings</div>
-    <div class="tags">{findings_html}</div>
+    <div id="findings" class="tags">{findings_html}</div>
   </div>
 
   <div class="block card">
@@ -2359,7 +2368,6 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
 </div>
 
 <script>
-// Данные — отдельными константами, чтобы не путать фигурные скобки f-строки
 const ROWS = {rows_json};
 const CVE_MAP = {cve_map_json};
 const CVE_ENABLED = {cve_enabled_js};
@@ -2413,6 +2421,10 @@ function buildCvePanel(cves) {{
   html += '</tbody></table></div>';
   return html;
 }}
+
+/* ----- таблица ----- */
+let current = DATA.rows.slice();
+let lastSortKey = null;
 
 function render(rows) {{
   const tb = document.querySelector("#tbl tbody");
@@ -2484,27 +2496,57 @@ function render(rows) {{
   document.getElementById("stat-bad").textContent = bad;
 }}
 
-let current = DATA.rows.slice();
+function sortCurrent(k) {{
+  lastSortKey = k;
+  current.sort((a,b) => {{
+    if (DATA.cveEnabled && k===8) {{
+      const ca = getCves(a).length, cb = getCves(b).length;
+      return cb - ca; // по убыванию количества CVE
+    }}
+    return String(a[k]).localeCompare(String(b[k]), undefined, {{numeric:true}});
+  }});
+}}
+
 render(current);
 
-document.getElementById("q").addEventListener("input", e => {{
-  const q = e.target.value.toLowerCase();
-  if (!q) return render(DATA.rows);
-  const f = DATA.rows.filter(r => r.join(" ").toLowerCase().includes(q));
-  render(f);
+/* ----- фильтры: поиск + плашки Findings ----- */
+const ACTIVE = new Set();
+
+function applyFilters() {{
+  const q = (document.getElementById('q').value||"").toLowerCase();
+  let base = DATA.rows.slice();
+  if (ACTIVE.size) {{
+    base = base.filter(r => ACTIVE.has((r[1]||"").trim()));
+  }}
+  if (q) {{
+    base = base.filter(r => r.join(" ").toLowerCase().includes(q));
+  }}
+  current = base;
+  if (lastSortKey !== null) sortCurrent(lastSortKey);
+  render(current);
+}}
+
+document.getElementById("q").addEventListener("input", applyFilters);
+
+document.querySelectorAll("#findings .tag-btn").forEach(btn => {{
+  btn.addEventListener("click", () => {{
+    const p = btn.dataset.prod || "";
+    if (ACTIVE.has(p)) {{
+      ACTIVE.delete(p);
+      btn.classList.remove("active");
+    }} else {{
+      ACTIVE.add(p);
+      btn.classList.add("active");
+    }}
+    applyFilters();
+  }});
 }});
 
-// сортировка по клику на заголовке
+/* сортировка по клику на заголовке */
 document.querySelectorAll("#tbl thead th").forEach(th => {{
   th.addEventListener("click", () => {{
     const k = parseInt(th.dataset.k,10);
-    current.sort((a,b) => {{
-      if (DATA.cveEnabled && k===8) {{
-        const ca = getCves(a).length, cb = getCves(b).length;
-        return cb - ca; // по убыванию количества CVE
-      }}
-      return String(a[k]).localeCompare(String(b[k]), undefined, {{numeric:true}});
-    }});
+    sortCurrent(k);
     render(current);
   }});
 }});
@@ -2514,6 +2556,7 @@ document.querySelectorAll("#tbl thead th").forEach(th => {{
 """
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
+
 
 
 
