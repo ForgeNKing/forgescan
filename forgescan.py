@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ForgeScan v2.1.0 — Massive Web Vendor & Version Scanner (single file)
+ForgeScan v2.1.1 — Massive Web Vendor & Version Scanner (single file)
 """
 
 import asyncio
