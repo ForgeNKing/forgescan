@@ -415,22 +415,23 @@ SIGNATURES = [
     },
 
     # Fortinet FortiGate (improved)
-    {"name":"Fortinet FortiGate","vendor":"Fortinet","score":40,
-     "matchers":[
-        {"title": r"FortiGate|Fortinet|SSL VPN Portal"},
-        {"body": r"FortiGate|FortiOS|FortiClient|fgt_lang|svpn"},
-        {"headers":{"server": r"Forti(?:Gate|Web|net)|FortiHTTP"}},
-        {"cookie": r"(?:FGTSSID|SVPNCOOKIE|ccsrftoken)"},
-        {"path_probe":{"path": "/remote/login","status_max":399,"contains": r"Forti(?:Gate|OS)|Fortinet"}},
-        {"path_probe":{"path": "/login","status_max":399,"contains": r"Forti(?:Gate|OS)|Fortinet"}}
-     ],
-     "version_extract":[
-        r"FortiOS\\s*v?([0-9]+(?:\\.[0-9]+){1,3})",
-        r"FortiGate\\s*v?([0-9]+(?:\\.[0-9]+){1,3})",
-        r'version\\s*[=:]\\s*([0-9]+(?:\\.[0-9]+){1,3})'
-     ]
+    {"name":"Fortinet FortiGate","vendor":"Fortinet","score":60,
+	 "matchers":[
+	    {"title": r"FortiGate|Fortinet|SSL VPN Portal"},
+	    {"body": r"FortiGate|FortiOS|FortiClient|fgt_lang|ftnt-|ftnt-fortinet-grid|nu-theme-neutrino|sslvpn|launchFortiClient"},
+	    {"headers":{"server": r"Forti(?:Gate|Web|net)|FortiHTTP"}},
+	    {"cookie": r"(?:FGTSSID|SVPNCOOKIE|ccsrftoken)"},
+	    {"path_probe":{"path": "/remote/login?lang=en","status_max":399,"contains": r"Forti(?:Gate|OS)|Fortinet|fgt_lang|sslvpn"}},
+	    {"path_probe":{"path": "/login","status_max":399,"contains": r"Forti(?:Gate|OS)|Fortinet|fgt_lang|sslvpn"}},
+	    {"path_probe":{"path": "/remote/fgt_lang?lang=en","status_max":399,"contains": r"fgt_lang|Username|Password"}}
+	 ],
+	 "version_extract":[
+	    r"FortiOS\\s*v?([0-9]+(?:\\.[0-9]+){1,3})",
+	    r"FortiGate\\s*v?([0-9]+(?:\\.[0-9]+){1,3})",
+	    r'version\\s*[=:]\\s*([0-9]+(?:\\.[0-9]+){1,3})'
+	 ],
+	 "no_generic_version": True
     },
-
     {"name":"Cisco ASA","vendor":"Cisco","score":30,
      "matchers":[{"title": r"Cisco Adaptive Security Appliance|ASA"}, {"body": r"Cisco ASDM|ASA"}],
      "version_extract":[r"ASA\s*([0-9]+(?:\.[0-9]+)*(?:\([^)]+\))?[A-Za-z0-9-]*)"]
@@ -570,12 +571,18 @@ SIGNATURES = [
      "version_extract":[r"Umbraco\\s*([0-9.]+)"]
     },
     {"name":"Magento","vendor":"Adobe/Magento","score":26,
-     "matchers":[
-        {"meta":{"name":"generator","regex": r"Magento"}},
-        {"headers":{"x-magento-cache-debug": r".*"}},
-     ],
-     "version_extract":[r"Magento\\s*([0-9.]+)"]
+	 "matchers":[
+	    {"meta":{"name":"generator","regex": r"Magento"}},
+	    {"headers":{"x-magento-cache-debug": r".*"}},
+	    {"headers":{"x-magento-vary": r".*"}},
+	    {"cookie": r"(?:^|;\s*)mage[-_][^=]+="}
+	 ],
+	 "version_extract":[r"Magento\\s*([0-9.]+)"],
+	 "no_generic_version": True,
+	 "no_generic_assets": True,
+	 "min_clues": 2
     },
+
     {"name":"PrestaShop","vendor":"PrestaShop","score":26,
      "matchers":[{"meta":{"name":"generator","regex": r"PrestaShop"}},{"title": r"PrestaShop"}],
      "version_extract":[r"PrestaShop\\s*([0-9.]+)"]
@@ -871,6 +878,12 @@ def gitlab_version_from_gon(html: str):
 
 
 class FingerprintEngine:
+    """
+    Движок сигнатурного отпечатка.
+    Изменения:
+      • 'headers' matcher: отсутствие заголовка больше не считается совпадением.
+      • учитывается rule['min_clues'] (минимум «улик») перед добавлением результата.
+    """
     def __init__(self, signatures, generic_version_regex):
         self.rules = signatures
         self.generic_version_regex = [re.compile(x, re.I) for x in generic_version_regex]
@@ -878,7 +891,7 @@ class FingerprintEngine:
     def match(self, ctx):
         results = []
         body_text = ctx.get("body_text", "") or ""
-        headers_join = ctx["headers_join"]
+        headers_join = ctx.get("headers_join", "")
 
         # Быстрый хинт: есть ли на странице gitlab gon.*
         has_gitlab_gon = bool(
@@ -895,12 +908,20 @@ class FingerprintEngine:
 
             # --- стандартные матчеры ---
             for m in rule.get("matchers", []):
+                # Заголовки HTTP
                 if "headers" in m:
                     ok = True
                     for hk, hv in m["headers"].items():
-                        val = ctx["headers"].get(hk.lower(), "")
-                        if hk.lower() == "set-cookie":
-                            val = "; ".join(ctx.get("cookies", []))
+                        hk_l = hk.lower()
+                        # ВАЖНО: не подставляем "" как дефолт — хотим видеть отсутствие заголовка
+                        val = ctx["headers"].get(hk_l) if "headers" in ctx else None
+                        if hk_l == "set-cookie":
+                            # cookies у нас отдельным списком; берём их, если есть
+                            val = "; ".join(ctx.get("cookies", [])) or None
+                        # отсутствующий заголовок — это НЕ совпадение
+                        if not val:
+                            ok = False
+                            break
                         if not safe_regex_search(hv, val):
                             ok = False
                             break
@@ -909,18 +930,21 @@ class FingerprintEngine:
                         evidence.append("headers")
                         name_clues += 1
 
+                # <title>
                 if "title" in m and ctx.get("title"):
                     if safe_regex_search(m["title"], ctx["title"]):
                         conf += base * 0.7
                         evidence.append("title")
                         name_clues += 1
 
+                # Тело страницы
                 if "body" in m and body_text:
                     if safe_regex_search(m["body"], body_text):
                         conf += base * 0.5
                         evidence.append("body")
                         name_clues += 1
 
+                # Куки
                 if "cookie" in m and ctx.get("cookies"):
                     cookies = "; ".join(ctx.get("cookies", []))
                     if safe_regex_search(m["cookie"], cookies):
@@ -928,19 +952,21 @@ class FingerprintEngine:
                         evidence.append("cookie")
                         name_clues += 1
 
+                # <meta name="...">
                 if "meta" in m and ctx.get("meta"):
                     meta = m["meta"]
-                    name = meta.get("name","").lower()
-                    regex = meta.get("regex",".*")
+                    name = meta.get("name", "").lower()
+                    regex = meta.get("regex", ".*")
                     if name in ctx["meta"] and safe_regex_search(regex, ctx["meta"][name]):
                         conf += base * 0.5
                         evidence.append(f"meta:{name}")
                         name_clues += 1
 
+                # Пробы путей
                 if "path_probe" in m:
                     pp = m["path_probe"]
-                    path = pp.get("path","/")
-                    pdata = ctx["probes"].get(path)
+                    path = pp.get("path", "/")
+                    pdata = ctx["probes"].get(path) if "probes" in ctx else None
                     if pdata and isinstance(pdata, dict):
                         try:
                             status_max = int(pp.get("status_max", 399))
@@ -951,8 +977,9 @@ class FingerprintEngine:
                             status_int = int(status_val) if status_val is not None else 999
                         except Exception:
                             status_int = 999
+
                         if status_int <= status_max:
-                            txt = pdata.get("text","") or ""
+                            txt = pdata.get("text", "") or ""
                             contains = pp.get("contains")
                             digits_only = pp.get("digits_only", False)
                             jvk = pp.get("json_version_key", "___none___")
@@ -971,7 +998,7 @@ class FingerprintEngine:
                                 jobj = pdata.get("json")
                                 if jobj is not None:
                                     val = keypath_get(jobj, jvk)
-                                    if isinstance(val, (str,int,float)):
+                                    if isinstance(val, (str, int, float)):
                                         sv = str(val)
                                         if re.match(r"^[0-9]+(?:\.[0-9]+){1,3}", sv):
                                             version = version or sv
@@ -983,7 +1010,6 @@ class FingerprintEngine:
 
             # --- GitLab: gon.* как самостоятельный признак + извлечение версии ---
             if rule.get("name") == "GitLab" and has_gitlab_gon:
-                # если до этого не было «name clues», добавим мягкий
                 if name_clues == 0:
                     name_clues = 1
                     conf = max(conf, base * 0.7)
@@ -992,14 +1018,13 @@ class FingerprintEngine:
                 ver_from_gon, rev = gitlab_version_from_gon(body_text)
                 if rev:
                     evidence.append(f"gitlab_gon_revision:{rev}")
-                    # если версию нашли по map — считаем почти уверенны
                     conf = max(conf, base * (0.9 if ver_from_gon else 0.6))
                 if ver_from_gon:
                     version = ver_from_gon
 
             # --- Регексы конкретного правила (title/body/headers/meta + из проб) ---
             if not version and name_clues > 0 and not rule.get("no_generic_assets"):
-                blobs = [ctx.get("title",""), body_text, headers_join, ctx.get("meta_join","")]
+                blobs = [ctx.get("title", ""), body_text, headers_join, ctx.get("meta_join", "")]
                 for rgx in rule.get("version_extract", []):
                     cre = re.compile(rgx, re.I)
                     found = False
@@ -1035,6 +1060,7 @@ class FingerprintEngine:
                         version = m.group(1)
                         evidence.append("js_var")
                         break
+
             if not version and name_clues > 0 and not rule.get("no_generic_version") and not rule.get("no_generic_assets"):
                 for asset in ctx.get("assets", []):
                     m = ASSET_VERSION_IN_QUERY.search(asset)
@@ -1048,26 +1074,28 @@ class FingerprintEngine:
                         evidence.append("asset_name")
                         break
 
-            # --- самый последний бэкап (ТЕПЕРЬ уважаем no_generic_version) ---
+            # --- последний бэкап (ТЕПЕРЬ уважаем no_generic_version) ---
             if conf > 0 and name_clues > 0 and not version and not rule.get("no_generic_version"):
                 for cre in self.generic_version_regex:
-                    m = cre.search(body_text) or cre.search(ctx.get("title","")) or cre.search(headers_join)
+                    m = cre.search(body_text) or cre.search(ctx.get("title", "")) or cre.search(headers_join)
                     if m:
                         version = m.group(1)
                         evidence.append("generic")
                         break
 
-            if conf > 0:
+            # --- добавляем результат только если хватает «улик» ---
+            min_required = int(rule.get("min_clues", 1))
+            if conf > 0 and name_clues >= min_required:
                 results.append({
                     "name": rule["name"],
-                    "vendor": rule.get("vendor",""),
-                    "confidence": round(min(conf, base*3), 2),
+                    "vendor": rule.get("vendor", ""),
+                    "confidence": round(min(conf, base * 3), 2),
                     "version": version or "",
                     "evidence": evidence,
                     "name_clues": name_clues
                 })
-        return sorted(results, key=lambda x: (x["confidence"], x["name_clues"]), reverse=True)
 
+        return sorted(results, key=lambda x: (x["confidence"], x["name_clues"]), reverse=True)
 
 
 class Scanner:
@@ -1273,9 +1301,24 @@ class Scanner:
             "assets": result["assets"],
         }
         fps = self.fp.match(ctx)
-        result["fingerprints"] = fps
-        result["best"] = fps[0] if fps else {}
+        # NEW: если хост ответил (любой 1xx..5xx), но ничего не нашли — помечаем Unknown
+        if (not fps) and _is_http_ok(result["status"]):
+            unk = {
+                "name": "Unknown",
+                "vendor": "",
+                "confidence": 0.0,
+                "version": "",
+                "evidence": ["http_response"],
+                "name_clues": 0,
+            }
+            result["fingerprints"] = [unk]
+            result["best"] = unk
+        else:
+            result["fingerprints"] = fps
+            result["best"] = fps[0] if fps else {}
+
         return result
+        
     async def _fetch_gitlab_signin_html(self, any_url):
         """
         Если текущая страница похожа на GitLab, но gon.revision не найден,
@@ -1708,25 +1751,31 @@ def expand_cli_targets(items):
 # -------- Findings summary helpers --------
 def build_findings(rows):
     """
-    Собирает сводку найденных продуктов только по целям, давшим HTTP-ответ.
-    rows: list of [url, name, version, vendor, conf, status, server, title]
-    returns dict: {product: [(url, version), ...]}
+    Собирает сводку найденных продуктов ТОЛЬКО по целям, давшим HTTP-ответ.
+    Если product пустой или '-', считаем его 'Unknown', чтобы такие хосты
+    попадали в Findings.
+    rows: list of [url, product, version, vendor, conf, http_status, server, title]
     """
     grouped = {}
     for r in (rows or []):
         if not _row_has_response(r):
             continue
+
         product = (r[1] or "").strip() if len(r) > 1 else ""
         if not product or product == "-":
-            continue
+            product = "Unknown"
+
         url = r[0] if len(r) > 0 else ""
         version = r[2] if len(r) > 2 and r[2] not in (None, "", "-") else "version not detected"
+
         grouped.setdefault(product, [])
         # Avoid duplicates for same URL within product
         if url and url not in [u for u, _ in grouped[product]]:
             grouped[product].append((url, version))
+
     # Sort by count desc, then name asc
     return dict(sorted(grouped.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())))
+
 
 
 def findings_to_markdown(findings):
