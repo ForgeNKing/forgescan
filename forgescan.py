@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-ForgeScan v2.1.1 — Massive Web Vendor & Version Scanner (single file)
+ForgeScan v2.1.0 — Massive Web Vendor & Version Scanner (single file)
 """
 
 import asyncio
@@ -27,6 +27,20 @@ except Exception:
 
 DEFAULT_USER_AGENT = f"ForgeScan/{__VERSION__} (+https://aurorascope.local) aiohttp"
 
+# Топовые веб-порты для -p top (уникальные, отсортированные)
+TOP_WEB_PORTS = sorted({
+    80,81,82,85,88,443,591,631,1311,1880,2222,2375,2376,2379,3000,
+    4040,4041,4042,4043,4171,4180,4200,4440,4646,4848,5000,5001,5480,5555,5601,
+    5900,5984,5985,5986,6080,6443,7001,7002,7080,7180,7183,7443,7473,7474,
+    8000,8001,8006,8008,8025,8042,8065,8069,8080,8081,8082,8083,8086,8088,8091,
+    8092,8093,8111,8153,8154,8180,8181,8200,8243,8280,8333,8404,8443,8444,8500,
+    8501,8530,8531,8834,8880,8881,8888,8889,8983,9000,9001,9043,9060,9080,9090,
+    9091,9093,9100,9200,9392,9440,9443,9600,9864,9869,9870,9901,9980,9990,10000,
+    10254,10443,15671,15672,16686,16992,16993,18080,19888,27117,28017,32400,
+    50070,50075,50090,61208
+})
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -45,12 +59,13 @@ def human_url(u: str) -> str:
 
 def normalize_targets(lines, ports=None):
     """
-    lines: iterable of raw targets (host, host:port, URL, etc.)
-    ports: Optional[Iterable[int]] - if provided, for bare hosts/host:port
-           we will schedule BOTH http:// and https:// for each port.
-           If not provided, legacy behavior (try http, fallback to https in scan_one).
+    lines: iterable строк-целей (IP/host, host:port, URL с/без пути).
+    ports: Optional[Iterable[int]] — если задано (в т.ч. через -p top/all/CSV),
+           для КАЖДОЙ цели генерируем http:// и https:// c КАЖДЫМ портом,
+           при этом встроенный в строку порт/путь игнорируется.
+    Если ports не задан — старое поведение: для 'host' -> http://host/ (HTTPS фоллбек в scan_one).
     """
-    # parse ports
+    # подготовим список портов
     port_list = []
     if ports:
         seenp = set()
@@ -58,52 +73,81 @@ def normalize_targets(lines, ports=None):
             try:
                 pi = int(str(p).strip())
                 if 1 <= pi <= 65535 and pi not in seenp:
-                    port_list.append(pi); seenp.add(pi)
+                    port_list.append(pi)
+                    seenp.add(pi)
             except Exception:
                 pass
+
     targets = []
+
     for raw in lines:
         line = (raw or "").strip()
         if not line or line.startswith("#"):
             continue
 
-        # already a URL with scheme
+        # Функция добавления пары схем для заданного host:port
+        def add_for_host_ports(hostname: str):
+            if not hostname:
+                return
+            if port_list:
+                for p in port_list:
+                    targets.append(f"http://{hostname}:{p}/")
+                    targets.append(f"https://{hostname}:{p}/")
+            else:
+                # Без -p: только HTTP (HTTPS попробуем в scan_one)
+                targets.append(f"http://{hostname}/")
+
+        # Случай 1: уже есть схема (http/https/другая)
         if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", line):
-            if not line.endswith("/"):
-                line = line + "/"
-            targets.append(line)
-            continue
-
-        # hostname[:port]
-        host = line
-        explicit_port = None
-        if ":" in host and not host.endswith("://"):
-            h, _, port = host.partition(":")
             try:
-                explicit_port = int(port)
-                host = h
+                pu = urlparse(line)
+                host = pu.hostname or ""
+                if port_list:
+                    # Требование: если -p задан, игнорируем порт/путь из исходной строки
+                    add_for_host_ports(host)
+                else:
+                    # Старое поведение: оставляем как есть, только завершаем слешем
+                    url = line if line.endswith("/") else line + "/"
+                    targets.append(url)
             except Exception:
-                explicit_port = None
-
-        # if ports provided, expand BOTH schemes for each port (explicit included)
-        if port_list or explicit_port:
-            ports_to_use = list(port_list)
-            if explicit_port and explicit_port not in ports_to_use:
-                ports_to_use.append(explicit_port)
-            for p in ports_to_use:
-                targets.append(f"http://{host}:{p}/")
-                targets.append(f"https://{host}:{p}/")
+                # если парсер вдруг не справился — попробуем как host
+                add_for_host_ports(line)
             continue
 
-        # legacy behavior: try HTTP first; HTTPS fallback in scan_one
-        targets.append(f"http://{host}/")
+        # Случай 2: строка БЕЗ схемы, но с портом и/или путём, типа: "1.2.3.4:8080/x"
+        # Подставим "http://" временно, чтобы распарсить netloc/path корректно
+        has_colon = ":" in line
+        has_slash = "/" in line
+        if (has_colon or has_slash) and "://" not in line:
+            try:
+                pu = urlparse("http://" + line)
+                host = pu.hostname or ""
+                # Если список портов задан — игнорируем явный порт/путь и разворачиваем по -p
+                if port_list:
+                    add_for_host_ports(host)
+                else:
+                    # Без -p: если порт был — сохраним его, иначе просто host
+                    if pu.port:
+                        targets.append(f"http://{host}:{pu.port}/")
+                    else:
+                        targets.append(f"http://{host}/")
+            except Exception:
+                # Произошла ошибка — трактуем как голый host
+                add_for_host_ports(line)
+            continue
 
-    # dedup preserving order
-    seen = set(); uniq = []
+        # Случай 3: просто "host" или "ip"
+        add_for_host_ports(line)
+
+    # дедуп с сохранением порядка
+    seen = set()
+    uniq = []
     for t in targets:
         if t not in seen:
-            uniq.append(t); seen.add(t)
+            uniq.append(t)
+            seen.add(t)
     return uniq
+
 
 
 def extract_title(html: str) -> str:
@@ -1321,20 +1365,51 @@ def truncate_display(s: str, maxw: int) -> str:
         return ''.join(start_codes) + res_plain + (end_reset if not raw.endswith(end_reset) else '')
     return res_plain
 
+def _is_http_ok(code) -> bool:
+    """
+    Возвращает True, если код похож на валидный HTTP-статус (1xx..5xx).
+    Любые ошибки сети/таймауты, где статуса нет, вернут False.
+    """
+    try:
+        n = int(str(code))
+        return 100 <= n <= 599
+    except Exception:
+        return False
+
+def _row_has_response(row) -> bool:
+    """
+    Ожидаемый формат строки:
+      [0 Target, 1 Product, 2 Version, 3 Vendor, 4 Confidence, 5 HTTP, 6 Server, 7 Title]
+    Показываем только те строки, где есть валидный HTTP-код.
+    """
+    try:
+        return len(row) > 5 and _is_http_ok(row[5])
+    except Exception:
+        return False
+
 
 def fmt_table(rows, headers, colorize=None):
-    # rows: list of raw values (not colored). colorize(col_idx, raw_value, cut_value)->str
+    """
+    Рендер статической таблицы для консоли.
+    Теперь скрывает все строки без HTTP-ответа.
+    """
+    # фильтрация "живых" строк
+    rows = [r for r in (rows or []) if _row_has_response(r)]
+
     # compute widths on visible (ANSI-stripped) text
     widths = []
     for i, h in enumerate(headers):
         col_vals = [strip_ansi(r[i]) for r in rows] if rows else []
         w = max(len(strip_ansi(h)), *(len(str(v)) for v in col_vals)) if col_vals else len(strip_ansi(h))
         widths.append(min(60, w))
+
     def cut_raw(s, w):
         s = str(s)
         return s if len(s) <= w else s[:w-1] + "…"
+
     sep = "+".join("-"*(w+2) for w in widths)
     out = [sep]
+
     # Header (colorize if provided for -1 index)
     hdr_cells = []
     for i, h in enumerate(headers):
@@ -1344,10 +1419,11 @@ def fmt_table(rows, headers, colorize=None):
         hdr_cells.append(cell + ' ' * max(0, widths[i] - display_width(cell)))
     out.append("| " + " | ".join(hdr_cells) + " |")
     out.append(sep)
+
     for r in rows:
         cells = []
         for i in range(len(headers)):
-            raw = r[i]
+            raw = r[i] if i < len(r) else ""
             cell = cut_raw(raw, widths[i])
             if colorize:
                 cell = colorize(i, raw, cell)
@@ -1355,8 +1431,6 @@ def fmt_table(rows, headers, colorize=None):
         out.append("| " + " | ".join(cells) + " |")
     out.append(sep)
     return "\n".join(out)
-
-
 
 # --- Live rendering helpers ---
 ANSI = {
@@ -1500,27 +1574,39 @@ class _LivePrinter:
 _live_printer = _LivePrinter()
 
 def render_live_table(rows, headers, done, total, use_color, tail_hint=None):
-    # Only print the delta rows, keep a single progress line at the bottom.
+    """
+    Инкрементальный рендер без полного перерисовывания.
+    Теперь выводит только строки с валидным HTTP-статусом.
+    """
     colorize = colorize_factory(use_color)
-    # Prepare display rows (formatting values) just like the static table
+
+    # оставляем только "живые" строки
+    rows = [r for r in (rows or []) if _row_has_response(r)]
+
     def _display(r):
+        # защита от коротких строк
+        c = (list(r) + [""]*8)[:8]
         return [
-            r[0],                                 # Target
-            colorize(1, r[1], r[1]),               # Product
-            colorize(2, r[2], r[2]),               # Version
-            r[3],                                 # Vendor
-            colorize(4, r[4], str(r[4])),            # Confidence
-            colorize(5, r[5], r[5]),                  # HTTP
-            r[6],                                 # Server
-            r[7],                                 # Title
+            c[0],                               # Target
+            colorize(1, c[1], c[1]),            # Product
+            colorize(2, c[2], c[2]),            # Version
+            c[3],                               # Vendor
+            colorize(4, c[4], str(c[4])),       # Confidence
+            colorize(5, c[5], c[5]),            # HTTP
+            c[6],                               # Server
+            c[7],                               # Title
         ]
+
     display_rows = [ _display(r) for r in rows ]
+
     # Ensure header printed
     _live_printer.ensure_header(headers, use_color, total)
+
     # Append only the new rows since last call
     to_print = display_rows[_live_printer.printed_rows:]
     _live_printer.append_rows(to_print, done, total)
     _live_printer.printed_rows = len(display_rows)
+
 
 
 def save_json(path, data):
@@ -1528,31 +1614,68 @@ def save_json(path, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 def save_csv(path, rows, headers):
+    """
+    CSV-экспорт. Скрывает строки без HTTP-ответа.
+    """
     import csv
+    rows = [r for r in (rows or []) if _row_has_response(r)]
     with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f); w.writerow(headers); [w.writerow(r) for r in rows]
+        w = csv.writer(f)
+        w.writerow(headers)
+        for r in rows:
+            # выравниваем длину строки под заголовки
+            out = [(r[i] if i < len(r) else "") for i in range(len(headers))]
+            w.writerow(out)
+
 
 def render_md(rows, headers):
+    """
+    Markdown-таблица. Скрывает строки без HTTP-ответа.
+    """
+    rows = [r for r in (rows or []) if _row_has_response(r)]
     lines = ["| " + " | ".join(headers) + " |", "|" + "|".join("---" for _ in headers) + "|"]
     for r in rows:
-        lines.append("| " + " | ".join(str(c).replace("\n"," ") for c in r) + " |")
+        cells = []
+        for i in range(len(headers)):
+            v = r[i] if i < len(r) else ""
+            cells.append(str(v).replace("\n", " "))
+        lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
+
 def _split_csv_ports(s: str):
+    """
+    Парсит аргумент -p:
+      - 'top'  -> список TOP_WEB_PORTS
+      - 'all'  -> порты 1..65535  (ОСТОРОЖНО: очень много целей)
+      - CSV    -> '80,443,8080' и т.п.
+    Возвращает List[int].
+    """
     if not s:
         return []
+    val = str(s).strip().lower()
+    if val == "top":
+        return list(TOP_WEB_PORTS)
+    if val == "all":
+        # Предупреждение: породит 65535*2 URL'ов (и больше, если много хостов)
+        return list(range(1, 65536))
+
     out = []
+    seen = set()
     for chunk in s.split(","):
         chunk = chunk.strip()
         if not chunk:
             continue
         try:
             v = int(chunk)
-            if 1 <= v <= 65535:
+            if 1 <= v <= 65535 and v not in seen:
                 out.append(v)
+                seen.add(v)
         except Exception:
+            # игнорируем мусор
             pass
     return out
+
 
 
 def expand_cli_targets(items):
@@ -1585,39 +1708,26 @@ def expand_cli_targets(items):
 # -------- Findings summary helpers --------
 def build_findings(rows):
     """
+    Собирает сводку найденных продуктов только по целям, давшим HTTP-ответ.
     rows: list of [url, name, version, vendor, conf, status, server, title]
     returns dict: {product: [(url, version), ...]}
     """
     grouped = {}
-    for r in rows:
-        product = (r[1] or "").strip()
+    for r in (rows or []):
+        if not _row_has_response(r):
+            continue
+        product = (r[1] or "").strip() if len(r) > 1 else ""
         if not product or product == "-":
             continue
-        url = r[0]
-        version = r[2] if r[2] not in (None, "", "-") else "version not detected"
+        url = r[0] if len(r) > 0 else ""
+        version = r[2] if len(r) > 2 and r[2] not in (None, "", "-") else "version not detected"
         grouped.setdefault(product, [])
         # Avoid duplicates for same URL within product
-        if url not in [u for u, _ in grouped[product]]:
+        if url and url not in [u for u, _ in grouped[product]]:
             grouped[product].append((url, version))
     # Sort by count desc, then name asc
     return dict(sorted(grouped.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())))
 
-def print_findings_console(findings, use_color=True):
-    if not findings:
-        return
-    c = ANSI if use_color else {k:"" for k in ANSI}
-    print("\n" + (f"{c['magenta']}{c['bold']}Findings{c['reset']}" if use_color else "Findings") + ":")
-    for product, items in findings.items():
-        header = f"{product} ({len(items)}):"
-        if use_color:
-            header = f"{ANSI['cyan']}{ANSI['bold']}{product}{ANSI['reset']} ({len(items)}):"
-        print(header)
-        for url, ver in items:
-            if ver and ver != "version not detected":
-                vdisp = f"{ANSI['green']}{ver}{ANSI['reset']}" if use_color else ver
-            else:
-                vdisp = f"{ANSI['gray']}version not detected{ANSI['reset']}" if use_color else "version not detected"
-            print(f"  • {url} — {vdisp}")
 
 def findings_to_markdown(findings):
     if not findings:
@@ -1656,7 +1766,7 @@ CPE_MAP = {
     "Kibana": [("elastic","kibana")],
     "Zabbix": [("zabbix","zabbix")],
     "Microsoft Exchange Server": [("microsoft","exchange_server")],
-    "Outlook Web App": [("microsoft","exchange_server")],
+    "Outlook Web App": [("microsoft","exchange_server"),("microsoft","outlook_web_access")],
     "WordPress": [("wordpress","wordpress")],
     "Joomla!": [("joomla","joomla")],
     "Grafana": [("grafana","grafana")],
@@ -1737,8 +1847,75 @@ def _cmp_ver(a: str, b: str) -> int:
     if A > B: return 1
     return 0
 
+def _exchange_track_from_build(v: str):
+    """
+    По билду Exchange (например, '14.3.513.0' или '15.02.1234.5') возвращает трек:
+    '2007' | '2010' | '2013' | '2016' | '2019' | None
+    """
+    nums = _split_ver(v)
+    if len(nums) < 1:
+        return None
+    major = nums[0]
+    minor = nums[1] if len(nums) >= 2 else 0
+    if major == 8:
+        return "2007"
+    if major == 14:
+        return "2010"
+    if major == 15:
+        if minor >= 2:
+            return "2019"
+        if minor == 1:
+            return "2016"
+        if minor == 0:
+            return "2013"
+    return None
+
+def _exchange_track_from_bound(s: str):
+    """
+    По строке из границы CPE (например, '15.02.2562.020' или '2019')
+    возвращает трек Exchange: '2010'/'2013'/'2016'/'2019'/... либо None.
+    """
+    if not s:
+        return None
+    s = str(s).strip()
+    # В некоторых CPE version — это просто год ('2019', '2016' и т.п.)
+    if re.fullmatch(r"\d{4}", s):
+        return s
+    nums = _split_ver(s)
+    if len(nums) < 1:
+        return None
+    major = nums[0]
+    minor = nums[1] if len(nums) >= 2 else 0
+    if major == 8:
+        return "2007"
+    if major == 14:
+        return "2010"
+    if major == 15:
+        if minor >= 2:
+            return "2019"
+        if minor == 1:
+            return "2016"
+        if minor == 0:
+            return "2013"
+    return None
+
+
 def _ver_in_range(ver, start_inc=None, start_exc=None, end_inc=None, end_exc=None, exact=None):
+    """
+    Возвращает True, если версия `ver` попадает в указанные границы/точное совпадение.
+    ВАЖНОЕ ИЗМЕНЕНИЕ: если НЕТ НИ ОДНОЙ ГРАНИЦЫ И НЕТ exact (т.е. CPE '...:version:*:...'),
+    мы считаем такой диапазон НЕИНФОРМАТИВНЫМ и возвращаем False (чтобы отсечь «шумные» CVE).
+    """
     ver = _norm_ver(ver)
+
+    # Если нет НИ одного ограничения — считаем, что диапазон неинформативен → не матчим
+    has_constraint = bool(
+        (exact is not None and exact != "*") or
+        start_inc or start_exc or end_inc or end_exc
+    )
+    if not has_constraint:
+        return False
+
     if exact and exact != "*" and _cmp_ver(ver, exact) != 0:
         return False
     if start_inc and _cmp_ver(ver, start_inc) < 0:
@@ -1750,6 +1927,7 @@ def _ver_in_range(ver, start_inc=None, start_exc=None, end_inc=None, end_exc=Non
     if end_exc and _cmp_ver(ver, end_exc) >= 0:
         return False
     return True
+
 
 def _format_range(start_inc=None, start_exc=None, end_inc=None, end_exc=None, exact=None):
     if exact and exact != "*":
@@ -1862,6 +2040,63 @@ def _extract_cve_title(cve_obj):
             return txt
     return ""
 
+def _poc_links_from_nvd(cve_obj):
+    """
+    Собираем ссылки на PoC/эксплойты из NVD (cve.references).
+    Берём те, у которых теги содержат Exploit / Proof of Concept,
+    либо очевидные домены (github, exploit-db, packetstorm, seclists и т.д.).
+    Возвращаем список словарей: {"source": "...", "url": "..."}.
+    """
+    out = []
+    cve = cve_obj.get("cve", {})
+    refs = cve.get("references") or []
+    # NVD 2.0: каждый ref: {"url": "...", "source": "...", "tags": [...]}
+    for ref in refs:
+        url = (ref.get("url") or "").strip()
+        if not url:
+            continue
+        tags = [str(t).lower() for t in (ref.get("tags") or [])]
+        host = ""
+        try:
+            from urllib.parse import urlparse
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            pass
+        good_domain = any(d in host for d in [
+            "github.com", "gitlab.com", "gist.github.com",
+            "exploit-db.com", "packetstormsecurity.com",
+            "seclists.org", "ssd-disclosure", "huntr.dev",
+            "projectdiscovery.io", "nuclei-templates"
+        ])
+        has_tag = any(t in tags for t in ["exploit", "proof of concept", "poc"])
+        if has_tag or good_domain:
+            label = ref.get("source") or host or "reference"
+            out.append({"source": label, "url": url})
+    # dedup по URL
+    seen = set(); dedup = []
+    for it in out:
+        if it["url"] in seen:
+            continue
+        seen.add(it["url"])
+        dedup.append(it)
+    return dedup
+
+
+def _search_links_for_cve(cve_id: str):
+    """
+    «Умные» поисковые ссылки — всегда безопасный fallback,
+    даже если прямых PoC не нашли.
+    """
+    cid = (cve_id or "").strip()
+    if not cid:
+        return []
+    return [
+        {"source": "GitHub search", "url": f"https://github.com/search?q={cid}"},
+        {"source": "Exploit-DB search", "url": f"https://www.exploit-db.com/search?cve={cid}"},
+        {"source": "Packet Storm search", "url": f"https://packetstormsecurity.com/search/?q={cid}"},
+        {"source": "Nuclei templates", "url": f"https://github.com/search?q={cid}+repo:projectdiscovery/nuclei-templates"},
+    ]
+
 
 def _is_cve_unauth(cve_obj):
     """
@@ -1933,54 +2168,132 @@ def _iter_cpe_ranges(cve_obj, wanted_vendor_product=None):
 
 def filter_cves_for_version(vulns, product_version, vendors_products):
     """
-    Returns list of dicts: {id, title, published, score, severity, affected, description, unauth}
-    Only those where product_version is within any vulnerable range for desired vendor/product.
+    Возвращает список словарей:
+      { id, title, published, score, severity, affected, description, unauth, poc:[{source,url},...] }
+
+    Правила:
+    - Берём только CPE-правила с явными ограничителями (точная версия или start/end):
+      записи с 'version:*' и без границ отсеиваются (_ver_in_range это делает).
+    - Для Microsoft Exchange дополнительно сверяем «линию»:
+        14.x → 2010, 15.00 → 2013, 15.01 → 2016, 15.02 → 2019.
+      Если у правила линейка другая — отбрасываем.
+    - Если правило задаёт ТОЛЬКО линейку (exact='2010') без числовых границ —
+      считаем совпадением, если линейки равны.
     """
     out = []
     pv = _norm_ver(product_version)
-    for v in vulns:
+    my_exch_track = _exchange_track_from_build(pv)  # None для не-Exchange или если формат странный
+
+    for v in (vulns or []):
         cve_id = (v.get("cve") or {}).get("id")
         published = (v.get("cve") or {}).get("published")
+
+        # Заголовок/описание
         descs = ((v.get("cve") or {}).get("descriptions") or [])
         description = ""
         for d in descs:
             if d.get("lang") == "en":
-                description = d.get("value","")
+                description = d.get("value", "")
                 break
         title = _extract_cve_title(v)
         score, severity, pr, ui, av = _extract_metrics(v)
+
         matched = False
         best_range = None
+
         for (vendor, product, start_inc, start_exc, end_inc, end_exc, exact) in _iter_cpe_ranges(v, vendors_products):
-            if _ver_in_range(pv, start_inc, start_exc, end_inc, end_exc, exact if exact and exact != "*" else None):
+            is_exchange = (vendor == "microsoft" and product == "exchange_server")
+
+            # --- Спец-логика по линейке для Exchange ---
+            if is_exchange and my_exch_track:
+                # Если любые границы/точная версия указывают на конкретную линейку, и она отлична от нашей — отбрасываем
+                possible_tracks = set(
+                    t for t in [
+                        _exchange_track_from_bound(start_inc),
+                        _exchange_track_from_bound(start_exc),
+                        _exchange_track_from_bound(end_inc),
+                        _exchange_track_from_bound(end_exc),
+                        _exchange_track_from_bound(exact),
+                    ] if t
+                )
+                if possible_tracks and (my_exch_track not in possible_tracks):
+                    continue
+
+                # Если exact — это ГОД (линейка), и нет других числовых ограничений → матч по линейке
+                exact_is_track = bool(_exchange_track_from_bound(exact))
+                has_numeric_bounds = any(
+                    s and bool(re.search(r"\d+\.\d+", str(s)))
+                    for s in (start_inc, start_exc, end_inc, end_exc)
+                )
+                if exact_is_track and not has_numeric_bounds:
+                    if _exchange_track_from_bound(exact) == my_exch_track:
+                        matched = True
+                        best_range = (None, None, None, None, exact)
+                        # Т.к. это «чистая линейка», можно не искать дальше
+                        break
+                    else:
+                        continue  # другой трек
+
+                # Иначе — проверяем обычным числовым сравнением, НО exact-трек не передаём как exact,
+                # чтобы не требовать «14.x == 2010»
+                exact_for_range = None if exact_is_track else (exact if exact and exact != "*" else None)
+                if _ver_in_range(pv, start_inc, start_exc, end_inc, end_exc, exact_for_range):
+                    matched = True
+                    best_range = (start_inc, start_exc, end_inc, end_exc, exact)
+                    # Если диапазон ограничен с обеих сторон — хватит
+                    if (end_inc or end_exc) and (start_inc or start_exc):
+                        break
+                # иначе продолжаем перебирать другие cpeMatch
+                continue
+
+            # --- Обычные продукты (без спец-логики линейки) ---
+            if _ver_in_range(pv, start_inc, start_exc, end_inc, end_exc, (exact if exact and exact != "*" else None)):
                 matched = True
                 best_range = (start_inc, start_exc, end_inc, end_exc, exact)
                 if (end_inc or end_exc) and (start_inc or start_exc):
                     break
-        if matched:
-            rng = _format_range(
-                start_inc=best_range[0],
-                start_exc=best_range[1],
-                end_inc=best_range[2],
-                end_exc=best_range[3],
-                exact=(best_range[4] if best_range[4] != "*" else None)
-            )
-            out.append({
-                "id": cve_id,
-                "title": title,
-                "published": published,
-                "score": score,
-                "severity": severity,
-                "affected": rng,
-                "description": description,
-                "unauth": _is_cve_unauth(v)
-            })
-    # stable sort by published desc then score desc
+
+        if not matched:
+            continue
+
+        rng = _format_range(
+            start_inc=best_range[0],
+            start_exc=best_range[1],
+            end_inc=best_range[2],
+            end_exc=best_range[3],
+            exact=(best_range[4] if best_range[4] and best_range[4] != "*" else None)
+        )
+
+        # PoC/эксплойты
+        poc_links = _poc_links_from_nvd(v)
+        poc_links.extend(_search_links_for_cve(cve_id))
+        # dedup
+        seen = set(); poc_final = []
+        for it in poc_links:
+            u = it.get("url")
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            poc_final.append({"source": it.get("source") or "link", "url": u})
+
+        out.append({
+            "id": cve_id,
+            "title": title,
+            "published": published,
+            "score": score,
+            "severity": severity,
+            "affected": rng,
+            "description": description,
+            "unauth": _is_cve_unauth(v),
+            "poc": poc_final
+        })
+
     def _safe_date(s):
         try:
-            return datetime.fromisoformat(s.replace("Z","+00:00"))
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
         except Exception:
             return datetime.min.replace(tzinfo=timezone.utc)
+
     out.sort(key=lambda x: (_safe_date(x["published"]), x["score"] or 0.0), reverse=True)
     return out
 
@@ -2162,10 +2475,13 @@ def cves_to_markdown(cve_summary):
     return "\n".join(out)
 
 def save_html_report(path, rows, findings, cve_summary, generated_at=None, scanner_version=None):
+    # ✅ фильтруем строки: в отчёт идут только цели с валидным HTTP-ответом
+    rows_alive = [r for r in (rows or []) if _row_has_response(r)]
+
     generated_at = generated_at or now_iso()
     scanner_version = scanner_version or __VERSION__
 
-    # --- CVE: индекс (Product, Version) -> список CVE ---
+    # --- CVE: (Product, Version) -> список CVE (включая PoC ссылки) ---
     bypv = {}
     for item in cve_summary.get("by_product_version", []):
         key = f"{item.get('product','')}|||{item.get('version','')}"
@@ -2179,21 +2495,20 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
                 "affected": cv.get("affected") or "",
                 "description": cv.get("description") or "",
                 "unauth": bool(cv.get("unauth")),
-                "published": cv.get("published") or ""
+                "published": cv.get("published") or "",
+                "poc": list(cv.get("poc") or [])  # список словарей {source,url}
             })
         bypv[key] = cves_norm
     cve_enabled = bool(bypv)
 
-    # JSON payloads для JS
-    rows_json = json.dumps(rows, ensure_ascii=False)
+
+    rows_json = json.dumps(rows_alive, ensure_ascii=False)
     cve_map_json = json.dumps(bypv, ensure_ascii=False)
     cve_enabled_js = "true" if cve_enabled else "false"
 
-    # Безопасный escape для заголовков в Findings
     def esc(s: str) -> str:
         return (s or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-    # Кликабельные теги Findings (кнопки-фильтры)
     findings_html = (
         "".join(
             f'<button type="button" class="tag tag-btn" data-prod="{esc(p)}">{esc(p)} '
@@ -2201,7 +2516,6 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
             for p, v in findings.items()
         ) or '<span class="muted">No findings.</span>'
     )
-
     cve_th = '<th data-col="cve" data-k="8">CVE</th>' if cve_enabled else ""
 
     html = f"""<!doctype html>
@@ -2212,23 +2526,14 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
 <title>ForgeScan Report</title>
 <style>
   :root {{
-    --bg: #0b1020;
-    --card: rgba(255,255,255,0.08);
-    --card-2: rgba(255,255,255,0.06);
-    --text: #e7ecf3;
-    --muted: #9fb0c8;
-    --accent: #7cc7ff;
-    --green: #4ade80;
-    --yellow: #fde047;
-    --red: #ef4444;
-    --glass: rgba(255,255,255,0.1);
-    --ring: rgba(124,199,255,0.35);
+    --bg: #0b1020; --card: rgba(255,255,255,0.08); --card-2: rgba(255,255,255,0.06);
+    --text: #e7ecf3; --muted: #9fb0c8; --accent: #7cc7ff;
+    --green: #4ade80; --yellow: #fde047; --red: #ef4444;
+    --glass: rgba(255,255,255,0.1); --ring: rgba(124,199,255,0.35);
   }}
   html,body {{
     background: radial-gradient(1200px 800px at 10% -10%, #1a2a4a 0%, #0b1020 35%, #070b13 100%);
-    color: var(--text);
-    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial;
-    margin: 0;
+    color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial; margin: 0;
   }}
   .wrap {{ width: min(1200px, 94%); margin: 32px auto; }}
   .hero {{
@@ -2244,13 +2549,11 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
     box-shadow: 0 6px 30px rgba(0,0,0,.3), inset 0 1px 0 rgba(255,255,255,.04);
   }}
   .block {{ margin-top: 14px; }}
-  .toolbar {{
-    display:flex; gap:12px; align-items:center; flex-wrap:wrap;
-  }}
-  .search {{ flex:1 1 260px; min-width:0; position:relative; }} /* min-width:0 фиксирует наезд */
+  .toolbar {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
+  .search {{ flex:1 1 260px; min-width:0; position:relative; z-index:5; }}
   .search input {{
     width:100%; padding:10px 12px; border-radius:12px; background: var(--card-2); color:var(--text);
-    border:1px solid rgba(255,255,255,.1); outline:none;
+    border:1px solid rgba(255,255,255,.1); outline:none; position:relative; z-index:5;
   }}
   .tag {{
     display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border-radius: 999px;
@@ -2269,7 +2572,7 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
     backdrop-filter: blur(6px); z-index: 2;
   }}
 
-  /* Ширины по % (с CVE сумма = 100%) */
+  /* ширины */
   th[data-col="target"], td[data-col="target"] {{ width: 22%; }}
   th[data-col="product"], td[data-col="product"] {{ width: 13%; }}
   th[data-col="version"], td[data-col="version"] {{ width: 9%; }}
@@ -2289,21 +2592,14 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
   }}
 
   tbody tr:hover {{ background: rgba(255,255,255,.04); }}
-
   .pill {{ display:inline-flex; padding:2px 8px; border-radius:999px; font-size:12px; border:1px solid rgba(255,255,255,.15) }}
-  .ok {{ color: var(--green) }}
-  .warn {{ color: var(--yellow) }}
-  .bad {{ color: var(--red) }}
-  .muted {{ color: var(--muted) }}
-  .h2 {{ font-weight:600; margin:0 0 8px 0; font-size:18px }}
+  .ok {{ color: var(--green) }} .warn {{ color: var(--yellow) }} .bad {{ color: var(--red) }}
+  .muted {{ color: var(--muted) }} .h2 {{ font-weight:600; margin:0 0 8px 0; font-size:18px }}
   .mono {{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace; }}
 
-  /* CVE раскрывашка */
-  .cve-btn {{
-    display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:10px;
-    border:1px solid rgba(255,255,255,.18); background: var(--card-2);
-    user-select:none; cursor:pointer;
-  }}
+  /* CVE раскрывашка + ссылки */
+  .cve-btn {{ display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:10px;
+    border:1px solid rgba(255,255,255,.18); background: var(--card-2); user-select:none; cursor:pointer; }}
   .cve-btn .carat {{ transition: transform .18s ease; display:inline-block }}
   .cve-btn.open .carat {{ transform: rotate(180deg) }}
   tr.cve-expand > td {{ padding: 0; background: rgba(255,255,255,.035) }}
@@ -2321,11 +2617,14 @@ def save_html_report(path, rows, findings, cve_summary, generated_at=None, scann
   details.cve-detail > summary {{ list-style:none; cursor:pointer; outline:none; }}
   details.cve-detail > summary::-webkit-details-marker {{ display:none; }}
   details.cve-detail[open] > summary .mini-carat {{ transform: rotate(90deg) }}
-  .mini-carat {{
-    display:inline-block; width:0; height:0; border-top:5px solid transparent; border-bottom:5px solid transparent;
-    border-left:6px solid var(--muted); margin-right:6px; transition: transform .18s ease
-  }}
+  .mini-carat {{ display:inline-block; width:0; height:0; border-top:5px solid transparent; border-bottom:5px solid transparent;
+    border-left:6px solid var(--muted); margin-right:6px; transition: transform .18s ease }}
   .desc-box {{ margin-top:6px; padding:8px; background: var(--card-2); border:1px solid rgba(255,255,255,.12); border-radius:10px }}
+
+  .poc-list {{ list-style:none; padding-left:0; margin:8px 0 0 0 }}
+  .poc-list li {{ margin:6px 0 }}
+  .poc-list a {{ color: var(--accent); text-decoration:none; border-bottom:1px dotted rgba(124,199,255,.4) }}
+  .poc-list a:hover {{ border-bottom-color: transparent; }}
 </style>
 </head>
 <body>
@@ -2383,7 +2682,6 @@ function getCves(row) {{
   const key = keyFor(row);
   return DATA.cveMap[key] || [];
 }}
-
 function sevRank(sev) {{
   const s = (sev||"").toUpperCase();
   if (s === "CRITICAL") return 4;
@@ -2411,9 +2709,24 @@ function buildCvePanel(cves) {{
     const title = (cv.title||"").replace(/</g,"&lt;").replace(/>/g,"&gt;");
     const desc  = (cv.description||"").replace(/</g,"&lt;").replace(/>/g,"&gt;");
     const affected = (cv.affected||"").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+
+    const poc = Array.isArray(cv.poc) ? cv.poc : [];
+    let pocHtml = '';
+    if (poc.length) {{
+      pocHtml = '<div class="muted" style="margin-top:8px;">PoC / Exploits</div><ul class="poc-list">';
+      for (const p of poc) {{
+        const src = (p.source||'link').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        const url = (p.url||'#');
+        let host = '';
+        try {{ host = (new URL(url, window.location.href)).host; }} catch (e) {{}}
+        pocHtml += '<li><a href="'+url+'" target="_blank" rel="noopener">'+src+(host?(' — '+host):'')+'</a></li>';
+      }}
+      pocHtml += '</ul>';
+    }}
+
     html += '<tr><td class="mono">'+cv.id+'</td><td>';
     html += '<details class="cve-detail"><summary><span class="mini-carat"></span>'+title+'</summary>';
-    html += '<div class="desc-box"><div class="mono muted" style="margin-bottom:6px;">affected: '+(affected||'(unspecified)')+'</div>'+desc+'</div>';
+    html += '<div class="desc-box"><div class="mono muted" style="margin-bottom:6px;">affected: '+(affected||'(unspecified)')+'</div>'+desc+pocHtml+'</div>';
     html += '</details>';
     html += '</td><td>'+score+'</td><td class="'+sevCls+'">'+sev+unauth+'</td></tr>';
   }}
@@ -2501,7 +2814,7 @@ function sortCurrent(k) {{
   current.sort((a,b) => {{
     if (DATA.cveEnabled && k===8) {{
       const ca = getCves(a).length, cb = getCves(b).length;
-      return cb - ca; // по убыванию количества CVE
+      return cb - ca; // по убыванию CVE
     }}
     return String(a[k]).localeCompare(String(b[k]), undefined, {{numeric:true}});
   }});
@@ -2542,7 +2855,7 @@ document.querySelectorAll("#findings .tag-btn").forEach(btn => {{
   }});
 }});
 
-/* сортировка по клику на заголовке */
+/* сортировка по заголовкам */
 document.querySelectorAll("#tbl thead th").forEach(th => {{
   th.addEventListener("click", () => {{
     const k = parseInt(th.dataset.k,10);
@@ -2556,9 +2869,6 @@ document.querySelectorAll("#tbl thead th").forEach(th => {{
 """
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
-
-
-
 
 
 def generate_cve_html_blocks(cve_summary):
@@ -2600,6 +2910,39 @@ def generate_cve_html_blocks(cve_summary):
         buf.append("</div>")
         chunks.append("".join(buf))
     return "".join(chunks)
+
+def print_findings_console(findings, use_color=True):
+    """
+    Печатает сводку Findings в консоль.
+    Ожидает результат из build_findings({product: [(url, version), ...]}).
+    """
+    if not findings:
+        return
+
+    # локальные ANSI (не трогаем глобальный словарь)
+    if use_color:
+        c = ANSI
+    else:
+        c = {k: "" for k in ANSI}
+
+    title = "Findings"
+    if use_color:
+        title = f"{c['magenta']}{c['bold']}Findings{c['reset']}"
+    print("\n" + title + ":")
+
+    # product -> [(url, version), ...]
+    for product, items in findings.items():
+        header = f"{product} ({len(items)}):"
+        if use_color:
+            header = f"{c['cyan']}{c['bold']}{product}{c['reset']} ({len(items)}):"
+        print(header)
+
+        for url, ver in items:
+            if ver and ver != "version not detected":
+                vdisp = ver if not use_color else f"{c['green']}{ver}{c['reset']}"
+            else:
+                vdisp = "version not detected" if not use_color else f"{c['gray']}version not detected{c['reset']}"
+            print(f"  • {url} — {vdisp}")
 
 
 # ---------------- main scan flow ----------------
