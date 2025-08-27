@@ -528,18 +528,22 @@ SIGNATURES = [
     {"name":"HP Printer (Embedded Web Server)","vendor":"HP","score":34,
      "matchers":[
         {"title": r"(?:HP\s+)?(?:Color\s+)?LaserJet|HP\s+PageWide|HP\s+OfficeJet|Embedded Web Server"},
-        {"body": r"Embedded Web Server|EWS|HP\s+(?:LaserJet|PageWide|OfficeJet)"},
+        # было: "Embedded Web Server|EWS|HP ..." — ловило подстроку "news"
+        {"body": r"\bEmbedded Web Server\b|\bEWS\b|HP\s+(?:LaserJet|PageWide|OfficeJet)"},
         {"path_probe":{"path": "/DevMgmt/DiscoveryTree.xml","status_max":399,"contains": r"(?:HP|DiscoveryTree)"}},
         {"path_probe":{"path": "/DevMgmt/ProductConfigDyn.xml","status_max":399,"contains": r"(?:Firmware|Revision|Version)"}},
         {"path_probe":{"path": "/hp/device/DeviceInformation.xml","status_max":399,"contains": r"(?:DeviceInformation|Firmware)"}},
         {"path_probe":{"path": "/hp/device/DeviceInformationView","status_max":399,"contains": r"(?:Firmware|Revision|Version|HP)"}}
      ],
      "version_extract":[
-        r"Firmware(?:\\s*Revision|\\s*Version|\\s*Datecode)?\\s*[:=]\\s*([0-9A-Za-z._-]{3,})",
-        r"<Firmware(?:Version|Revision)[^>]*>\\s*([0-9A-Za-z._-]{3,})\\s*</Firmware(?:Version|Revision)>",
-        r'"firmware(?:Version|Revision)"\\s*:\\s*"([0-9A-Za-z._-]{3,})"',
-        r"FW(?:\\s*Rev(?:ision)?)?\\s*[:=]\\s*([0-9A-Za-z._-]{3,})"
-     ]
+        r"Firmware(?:\s*Revision|\s*Version|\s*Datecode)?\s*[:=]\s*([0-9A-Za-z._-]{3,})",
+        r"<Firmware(?:Version|Revision)[^>]*>\s*([0-9A-Za-z._-]{3,})\s*</Firmware(?:Version|Revision)>",
+        r'"firmware(?:Version|Revision)"\s*:\s*"([0-9A-Za-z._-]{3,})"',
+        r"FW(?:\s*Rev(?:ision)?)?\s*[:=]\s*([0-9A-Za-z._-]{3,})"
+     ],
+     # важные анти-шумы: запрещаем generic-ассеты и требуем >=2 улик (напр. body+probe)
+     "no_generic_assets": True,
+     "min_clues": 2
     },
 
     # --- CMS / Wikis / Blogs ---
@@ -642,8 +646,11 @@ SIGNATURES = [
      "version_extract":[r"ownCloud\\s*([0-9.]+)"]
     },
     {"name":"Roundcube Webmail","vendor":"Roundcube","score":28,
-     "matchers":[{"title": r"Roundcube\\s*Webmail|Roundcube"}],
-     "version_extract":[r"Roundcube\\s*(?:Webmail\\s*)?([0-9.]+)"]
+     "matchers":[{"title": r"Roundcube\s*Webmail|Roundcube"}],
+     "version_extract":[
+        r"Roundcube\s*(?:Webmail\s*)?([0-9.]+)",
+        r'"rcversion"\s*:\s*([0-9]{5,6})'
+     ]
     },
     {"name":"SOGo","vendor":"Inverse","score":24,
      "matchers":[{"title": r"SOGo"},{"body": r"SOGo"}],
@@ -906,6 +913,20 @@ def gitlab_version_from_gon(html: str):
     chosen = _prefer_by_ee(candidates, ee_flag)
     return (_clean_version(chosen) if chosen else None), rev
 
+def _roundcube_rcversion_to_semver(val: str) -> str:
+    """
+    Превращает числовой rcversion из Roundcube (напр. 10607, 11002)
+    в привычный вид: 1.6.7 или 11.0.2.
+    Правило: 5 цифр -> X.YY.ZZ, 6 цифр -> XX.YY.ZZ.
+    Если формат неожиданный — вернём как есть.
+    """
+    s = re.sub(r"\D+", "", str(val or ""))
+    if re.fullmatch(r"\d{5}", s):
+        return f"{int(s[0])}.{int(s[1:3])}.{int(s[3:5])}"
+    if re.fullmatch(r"\d{6}", s):
+        return f"{int(s[0:2])}.{int(s[2:4])}.{int(s[4:6])}"
+    return s
+
 
 class FingerprintEngine:
     """
@@ -1081,6 +1102,20 @@ class FingerprintEngine:
                             break
                     if found:
                         break
+            if rule.get("name") == "Roundcube Webmail":
+                # 1) если версию ещё не нашли — попробуем достать rcversion из тела
+                if not version and body_text:
+                    m_rc = re.search(r'"rcversion"\s*:\s*([0-9]{5,6})', body_text, re.I)
+                    if m_rc:
+                        version = _roundcube_rcversion_to_semver(m_rc.group(1))
+                        evidence.append("rcversion")
+                        # поднимем уверенность, если была только одна улика
+                        conf = max(conf, base * 0.6)
+                        if name_clues == 0:
+                            name_clues = 1
+                # 2) если уже есть «10607» — приведём к 1.6.7
+                if version and re.fullmatch(r"\d{5,6}", str(version)):
+                    version = _roundcube_rcversion_to_semver(str(version))
 
             # --- generic JS/assets версии (уважаем флаг no_generic_version) ---
             if not version and name_clues > 0 and not rule.get("no_generic_version") and not rule.get("no_generic_assets"):
