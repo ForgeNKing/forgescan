@@ -29,7 +29,7 @@ DEFAULT_USER_AGENT = f"ForgeScan/{__VERSION__} (+https://aurorascope.local) aioh
 
 # Топовые веб-порты для -p top (уникальные, отсортированные)
 TOP_WEB_PORTS = sorted({
-    80,81,82,85,88,443,591,631,1311,1880,2222,2375,2376,2379,3000,
+    80,81,82,85,88,443,444,591,631,1311,1880,2222,2375,2376,2379,3000,
     4040,4041,4042,4043,4171,4180,4200,4440,4646,4848,5000,5001,5480,5555,5601,
     5900,5984,5985,5986,6080,6443,7001,7002,7080,7180,7183,7443,7473,7474,
     8000,8001,8006,8008,8025,8042,8065,8069,8080,8081,8082,8083,8086,8088,8091,
@@ -431,23 +431,33 @@ SIGNATURES = [
     },
 
     # Fortinet FortiGate (improved)
-    {"name":"Fortinet FortiGate","vendor":"Fortinet","score":60,
-	 "matchers":[
-	    {"title": r"FortiGate|Fortinet|SSL VPN Portal"},
-	    {"body": r"FortiGate|FortiOS|FortiClient|fgt_lang|ftnt-|ftnt-fortinet-grid|nu-theme-neutrino|sslvpn|launchFortiClient"},
-	    {"headers":{"server": r"Forti(?:Gate|Web|net)|FortiHTTP"}},
-	    {"cookie": r"(?:FGTSSID|SVPNCOOKIE|ccsrftoken)"},
-	    {"path_probe":{"path": "/remote/login?lang=en","status_max":399,"contains": r"Forti(?:Gate|OS)|Fortinet|fgt_lang|sslvpn"}},
-	    {"path_probe":{"path": "/login","status_max":399,"contains": r"Forti(?:Gate|OS)|Fortinet|fgt_lang|sslvpn"}},
-	    {"path_probe":{"path": "/remote/fgt_lang?lang=en","status_max":399,"contains": r"fgt_lang|Username|Password"}}
-	 ],
-	 "version_extract":[
-	    r"FortiOS\\s*v?([0-9]+(?:\\.[0-9]+){1,3})",
-	    r"FortiGate\\s*v?([0-9]+(?:\\.[0-9]+){1,3})",
-	    r'version\\s*[=:]\\s*([0-9]+(?:\\.[0-9]+){1,3})'
-	 ],
-	 "no_generic_version": True
+    # Fortinet FortiGate (improved)
+    {"name": "Fortinet FortiGate",
+    "vendor": "Fortinet",
+    "score": 60,
+    # Для FortiGate часто единственным местом, где видна фирменная строка,
+    # является страница /remote/login?lang=en или /remote/fgt_lang?lang=en.
+    # На корневом URL никаких "name clues" нет, поэтому задаём min_clues=0
+    # чтобы path_probe в одиночку мог сработать. Список prob'ов оставляем
+    # прежним, но теперь их можно распознать даже без title/body/cookie.
+    "matchers": [
+        {"title": r"FortiGate|Fortinet|SSL VPN Portal"},
+        {"body": r"FortiGate|FortiOS|FortiClient|fgt_lang|ftnt-|ftnt-fortinet-grid|nu-theme-neutrino|sslvpn|launchFortiClient"},
+        {"headers": {"server": r"Forti(?:Gate|Web|net)|FortiHTTP"}},
+        {"cookie": r"(?:FGTSSID|SVPNCOOKIE|ccsrftoken)"},
+        {"path_probe": {"path": "/remote/login?lang=en", "status_max": 399, "contains": r"Forti(?:Gate|OS)|Fortinet|fgt_lang|sslvpn"}},
+        {"path_probe": {"path": "/login", "status_max": 399, "contains": r"Forti(?:Gate|OS)|Fortinet|fgt_lang|sslvpn"}},
+        {"path_probe": {"path": "/remote/fgt_lang?lang=en", "status_max": 399, "contains": r"fgt_lang|Username|Password"}}
+    ],
+    "version_extract": [
+        r"FortiOS\s*v?([0-9]+(?:\.[0-9]+){1,3})",
+        r"FortiGate\s*v?([0-9]+(?:\.[0-9]+){1,3})",
+        r'version\s*[=:]\s*([0-9]+(?:\.[0-9]+){1,3})'
+    ],
+    "no_generic_version": True,
+    "min_clues": 0
     },
+
     {"name":"Cisco ASA","vendor":"Cisco","score":30,
      "matchers":[{"title": r"Cisco Adaptive Security Appliance|ASA"}, {"body": r"Cisco ASDM|ASA"}],
      "version_extract":[r"ASA\s*([0-9]+(?:\.[0-9]+)*(?:\([^)]+\))?[A-Za-z0-9-]*)"]
@@ -808,6 +818,8 @@ DEFAULT_PROBE_PATHS = [
     # FortiGate / SSL VPN login
     "/remote/login",
     "/remote/login?lang=en",
+    # FortiGate language-specific login page contains fgt_lang & Username, used for detection
+    "/remote/fgt_lang?lang=en",
     # HP EWS / printers discovery & info
     "/DevMgmt/DiscoveryTree.xml",
     "/DevMgmt/ProductConfigDyn.xml",
@@ -818,6 +830,7 @@ DEFAULT_PROBE_PATHS = [
     "/hp/device/DeviceInformation.xml",
     "/hp/device/DeviceInformationView"
 ]
+
 
 JS_VERSION_REGEXPS = [
     r"window\.__APP_VERSION__\s*=\s*['\"]([0-9]+(?:\.[0-9]+){0,3})['\"]",
