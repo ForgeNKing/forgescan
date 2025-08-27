@@ -352,12 +352,28 @@ SIGNATURES = [
      ],
      "version_extract":[r"Alertmanager\s*([0-9.]+)"]
     },
-    {"name":"Zabbix","vendor":"Zabbix","score":25,
-     "matchers":[{"title": "Zabbix"}, {"cookie": "zbx_sessionid"}],
-     "version_extract":["Zabbix\\s*([0-9.]+)"],
-     "path_probe": "/api_jsonrpc.php",
-     "json_version_key": "result"
+    {
+        "name": "Zabbix",
+        "vendor": "Zabbix",
+        "score": 25,
+        # В ранних версиях path_probe/json_version_key располагались на верхнем уровне,
+        # поэтому не использовались движком. Перенос пробы в matchers обеспечивает
+        # фактический запрос к /api_jsonrpc.php и извлечение версии из ответа JSON.
+        "matchers": [
+            {"title": r"Zabbix"},
+            {"cookie": r"zbx_sessionid"},
+            {
+                "path_probe": {
+                    "path": "/api_jsonrpc.php",
+                    "json_version_key": "result",
+                    # явно указываем максимальный код ответа, при котором проба считается успешной
+                    "status_max": 399
+                }
+            }
+        ],
+        "version_extract": [r"Zabbix\s*([0-9.]+)"]
     },
+
     {"name":"Graylog","vendor":"Graylog","score":30,
      "matchers":[{"title": r"Graylog"}, {"body": r"Graylog Web Interface"}],
      "version_extract":[r"Graylog\s*v?([0-9]+\.[0-9.]+)"]
@@ -791,6 +807,7 @@ DEFAULT_PROBE_PATHS = [
     {"path": "/api_jsonrpc.php", "post_json": {"jsonrpc":"2.0","method":"apiinfo.version","params":{},"id":1,"auth": None}},
     # FortiGate / SSL VPN login
     "/remote/login",
+    "/remote/login?lang=en",
     # HP EWS / printers discovery & info
     "/DevMgmt/DiscoveryTree.xml",
     "/DevMgmt/ProductConfigDyn.xml",
