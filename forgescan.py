@@ -510,8 +510,10 @@ SIGNATURES = [
      "version_extract":[r"(?:vCenter|vSphere)\s*([0-9]+\.[0-9.]+)"]
     },
     {"name":"VMware ESXi","vendor":"VMware","score":30,
-     "matchers":[{"title": r"ESXi"}, {"body": r"VMware ESXi|/ui/"}],
-     "version_extract":[r"ESXi\s*([0-9]+\.[0-9.]+)"]
+     "matchers":[{"title": r"\bVMware\s*ESXi\b"}, {"body": r"\bVMware\s*ESXi\b"}],
+     "version_extract":[r"ESXi\s*v?([0-9]+(?:\.[0-9]+){1,2})"],
+     "no_generic_version": True,
+     "no_generic_assets": True
     },
 
     # Databases (web UIs)
@@ -522,6 +524,63 @@ SIGNATURES = [
     {"name":"Adminer","vendor":"Adminer","score":25,
      "matchers":[{"title": r"Adminer"}, {"body": r"Adminer"}],
      "version_extract":[r"Adminer\s*([0-9]+\.[0-9.]+)"]
+    },
+    # === Bitrix: строгий и надёжный вариант (рекомендуется) ===
+    {
+    "name": "1C-Bitrix (strict)",
+    "vendor": "Bitrix",
+    "score": 28,
+    "matchers": [
+        # Характерные пути Bitrix:
+        {"body": r"/bitrix/(?:js|templates|components|tools)/"},
+        # JS-артефакты Bitrix:
+        {"body": r"\bBX\.message\b|\bBX\.setJSList\b|bitrix\.info/ba\.js|\bbitrix_sessid\b"},
+        # Метка генератора, если не скрыта:
+        {"meta": {"name": "generator", "regex": r"(?:1C-)?Bitrix"}},
+        # Куки Bitrix:
+        {"cookie": r"\bBITRIX_[A-Z_]+|BX_USER_ID\b"}
+    ],
+    "min_clues": 2,
+    "no_generic_version": True,
+    "no_generic_assets": True,
+    # Иногда версия бывает в meta generator. Если её нет — ничего не извлекается.
+    "version_extract": [
+        r'(?is)<meta[^>]+name=["\']generator["\'][^>]+content=["\'](?:1C-)?Bitrix[^"\']*?([0-9]{1,2}\.[0-9]{1,2}(?:\.[0-9]{1,4})?)'
+    ]
+    },
+
+    # === Bitrix: “мягкий” вариант (поддерживает сайты, где часть улик скрыта) ===
+    {
+    "name": "1C-Bitrix (loose)",
+    "vendor": "Bitrix",
+    "score": 24,
+    "matchers": [
+        {"body": r"/bitrix/"},
+        {"body": r"\bBX\.message\b|\bbitrix_sessid\b"},
+        {"cookie": r"\bBITRIX_[A-Z_]+|BX_USER_ID\b"},
+        {"meta": {"name": "generator", "regex": r"(?:1C-)?Bitrix"}}
+    ],
+    "min_clues": 2,
+    "no_generic_version": True,
+    "no_generic_assets": True,
+    "version_extract": [
+        r'(?is)<meta[^>]+name=["\']generator["\'][^>]+content=["\'](?:1C-)?Bitrix[^"\']*?([0-9]{1,2}\.[0-9]{1,2}(?:\.[0-9]{1,4})?)'
+    ]
+    },
+
+# === Bitrix24 (облачный портал/CRM), отдельная сущность, чтобы не мешать CMS ===
+    {
+    "name": "Bitrix24 (cloud portal)",
+    "vendor": "Bitrix",
+    "score": 30,
+    "matchers": [
+        {"body": r"cdn\.bitrix24|bitrix24\.[a-z]+"},      # загрузка ассетов с CDN Bitrix24 или домены
+        {"body": r"\bBitrix24\b|\bBX24\b|\bintranet\b|\bopenlines\b|\bimol\b|\bcrm\b"},
+        {"cookie": r"\bBX_USER_ID\b|BITRIX_[A-Z_]+"}
+    ],
+    "min_clues": 2,
+    "no_generic_version": True,
+    "no_generic_assets": True
     },
 
     # --- Printers / EWS (HP LaserJet, PageWide, OfficeJet etc.) ---
@@ -2069,7 +2128,7 @@ async def nvd_fetch_all(session, vendor, product, api_key=None, timeout=25):
     vulns = []
     start_idx = 0
     results_per_page = 2000
-    vms = f"cpe:2.3:a:{vendor}:{product}:*:*:*:*:*:*:*"
+    vms = f"cpe:2.3:a:{vendor}:{product}:*:*:*:*:*:*:*:*"
     params_base = {
         "virtualMatchString": vms,
         "resultsPerPage": str(results_per_page),
