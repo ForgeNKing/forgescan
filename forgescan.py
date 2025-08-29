@@ -517,7 +517,7 @@ SIGNATURES = [
     # Databases (web UIs)
     {"name":"phpMyAdmin","vendor":"The phpMyAdmin Project","score":35,
      "matchers":[{"title": r"phpMyAdmin"}, {"body": r"phpMyAdmin"}],
-     "version_extract":[r"phpMyAdmin\s*([0-9]+\.[0-9.]+)"]
+     "version_extract":[r"phpMyAdmin\s*([0-9]+\.[0-9.]+)", r'CommonParams\.setAll\([^)]*version["\']?\s*[:=]\s*["\']([0-9]+(?:\.[0-9]+){1,3})']
     },
     {"name":"Adminer","vendor":"Adminer","score":25,
      "matchers":[{"title": r"Adminer"}, {"body": r"Adminer"}],
@@ -1908,7 +1908,7 @@ CPE_MAP = {
     "SonarQube": [("sonarsource","sonarqube")],
     "Nextcloud": [("nextcloud","nextcloud_server"), ("nextcloud","nextcloud")],
     "ownCloud": [("owncloud","owncloud_server"), ("owncloud","owncloud")],
-    "Roundcube Webmail": [("roundcube","roundcube_webmail"), ("roundcube","roundcube")],
+    "Roundcube Webmail": [("roundcube","roundcube_webmail"), ("roundcube","roundcube"), ("roundcube","webmail")],
     "osTicket": [("osticket","osticket")],
     "GLPI": [("teclib","glpi")],
     "Centreon": [("centreon","centreon")],
